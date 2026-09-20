@@ -183,7 +183,7 @@ class ProxyStreamHandler(
         val trackId: String,
         @Volatile var totalSizeBytes: Long,
         val cacheFile: File,
-        private val context: Context,
+        internal val context: Context,
         private val client: JellyfinClient,
         private val cacheManager: LRUCacheManager,
         private val db: AppDatabase
@@ -563,6 +563,7 @@ class ProxyStreamHandler(
             session.refCount.set(1)
             activeSessions[trackId] = session
             Log.d(TAG, "[$trackId] Created new session (refCount=1)")
+            StreamingService.start(context.applicationContext)
             return session
         }
 
@@ -572,12 +573,16 @@ class ProxyStreamHandler(
             val count = session.refCount.decrementAndGet()
             Log.d(TAG, "[$trackId] Session release called (remaining refCount=$count)")
             if (count <= 0) {
+                val appContext = session.context.applicationContext
                 session.scheduleGracefulCleanup(30_000L) {
                     synchronized(Companion) {
                         if (session.refCount.get() <= 0) {
                             activeSessions.remove(trackId)
                             session.close()
                             Log.d(TAG, "[$trackId] Session disposed after grace period.")
+                            if (activeSessions.isEmpty()) {
+                                StreamingService.stop(appContext)
+                            }
                         }
                     }
                 }

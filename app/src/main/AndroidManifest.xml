@@ -40,6 +40,12 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Streaming Foreground Service (prevents background freezing during playback) -->
+        <service
+            android:name=".stream.StreamingService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- Storage Access Framework Provider (Protected by MANAGE_DOCUMENTS permission) -->
         <provider
             android:name=".provider.JellyfinDocumentsProvider"

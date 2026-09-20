@@ -6,4 +6,8 @@
     <string name="root_summary">Your remote Jellyfin music collection</string>
     <string name="sync_channel_name">Library Sync</string>
     <string name="sync_channel_desc">Shows progress while syncing your Jellyfin music library</string>
+    <string name="streaming_channel_name">Audio Streaming</string>
+    <string name="streaming_channel_desc">Maintains background streaming connectivity during media playback</string>
+    <string name="streaming_notification_title">Jellyfin Audio Provider</string>
+    <string name="streaming_notification_text">Streaming audio to media player</string>
 </resources>
