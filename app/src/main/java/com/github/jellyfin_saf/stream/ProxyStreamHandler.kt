@@ -3,6 +3,8 @@ package com.github.jellyfin_saf.stream
 import android.content.Context
 import android.os.PowerManager
 import android.os.ProxyFileDescriptorCallback
+import android.system.ErrnoException
+import android.system.OsConstants
 import android.util.Log
 import com.github.jellyfin_saf.api.JellyfinClient
 import com.github.jellyfin_saf.cache.LRUCacheManager
@@ -13,11 +15,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.BufferedInputStream
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -26,17 +30,14 @@ import java.util.concurrent.atomic.AtomicInteger
 import okhttp3.Response
 
 /**
- * High-performance, glitch-free audio streaming bridge between Jellyfin and Android SAF / Poweramp.
+ * Standardized, resilient virtual file streaming bridge between Jellyfin and Android SAF.
  *
- * Features:
- * - Thread-safe active session sharing: Prevents duplicate download jobs and cache corruption
- *   when Poweramp opens the same track with multiple file descriptors (metadata inspection + playback).
- * - Thread-safe IntervalSet tracking to guarantee 0 sparse-gap / zero-hole decoder corruptions.
- * - Non-blocking positional FileChannel I/O: readChannel and writeChannel are decoupled.
- * - Single-connection continuous background prefetching with 128KB buffer.
- * - Initial 16KB header warm-up in init to eliminate FFmpeg EOF read timeouts over WAN.
- * - Non-blocking on-demand range retrieval for end-of-file metadata probes (RFC 7233 compliant).
- * - Automatic conversion to 100% locally cached track upon complete download.
+ * Implements a robust VFS read-through sparse cache architecture:
+ * - Decoupled lock-free positional FileChannel reads for zero-latency cache hits.
+ * - Single continuous background streaming worker with transparent HTTP Range auto-reconnection.
+ * - Non-blocking on-demand metadata footer retrieval without stream interruption.
+ * - Session keep-alive grace period preventing premature cache deletion during player probe cycles.
+ * - Strict POSIX EOF compliance: never returns 0 when offset < totalSizeBytes.
  */
 class ProxyStreamHandler(
     private val context: Context,
@@ -62,19 +63,13 @@ class ProxyStreamHandler(
     @Volatile
     private var isReleased = false
     private var lastReadEnd = -1L
-    private var sequentialBytesRead = 0L
 
     init {
         if (session.totalSizeBytes <= 0) {
             session.probeTotalSize()
         }
-        // Adaptive warmup:
-        // High-res audio (24-bit 96kHz / 192kHz) consumes 400-800 KB/sec.
-        // For hi-res tracks, warm up with 2MB to provide >5 seconds of initial audio buffer.
-        // For standard tracks, warm up with 512KB to provide >5 seconds of buffer.
-        val warmupBytes = if (session.isHighRes) 2097152L else 524288L
-        val warmupOffset = if (session.audioStartOffset > 256 * 1024L) session.audioStartOffset else 0L
-        session.waitForOffset(warmupOffset, warmupBytes, 3500L)
+        // Wait up to 5 seconds for initial header bytes (64 KB) to be ready on disk
+        session.waitForBytes(0L, minBytes = 65536L, timeoutMs = 5000L)
         cacheManager.onTrackAccessed(trackId)
     }
 
@@ -100,12 +95,7 @@ class ProxyStreamHandler(
         val maxPossible = if (totalSize > 0) minOf(size.toLong(), totalSize - offset).toInt() else size
         if (maxPossible <= 0) return 0
 
-        // Reset sequential tracking if read jumped to a different offset
-        if (offset != lastReadEnd) {
-            sequentialBytesRead = 0L
-        }
-
-        // 1. If bytes are already downloaded locally, read immediately via lock-free positional I/O
+        // 1. Fast path: data is already available locally on disk
         val available = session.intervals.getAvailableLengthFrom(offset)
         if (available > 0) {
             val toRead = minOf(maxPossible.toLong(), available).toInt()
@@ -113,81 +103,59 @@ class ProxyStreamHandler(
             val readBytes = if (n > 0) n else 0
             if (readBytes > 0) {
                 lastReadEnd = offset + readBytes
-                sequentialBytesRead += readBytes
-                checkPrefetcherReposition(lastReadEnd)
+                checkSeekReposition(lastReadEnd)
             }
             return readBytes
         }
 
-        // 2. Data not yet available locally
-        val isEndOfFileProbe = totalSize > 1024 * 1024L && offset >= (totalSize - 1024 * 1024L)
-
+        // 2. Cache miss: check if this is an end-of-file metadata probe (ID3v1, APE, FLAC seektable)
+        val isEndOfFileProbe = totalSize > 512 * 1024L && offset >= (totalSize - 512 * 1024L)
         if (isEndOfFileProbe) {
-            // Footer probe (ID3v1, APE tags, FLAC seektable): fetch starting directly at requested offset to EOF
-            val footerLength = minOf(totalSize - offset, 512 * 1024L)
-            session.fetchDirectRange(offset, footerLength)
+            val footerLen = minOf(totalSize - offset, 256 * 1024L)
+            session.fetchDirectRange(offset, footerLen)
         } else {
-            // Check if current background download job is actively approaching the requested offset
-            val prefetchOffset = session.currentPrefetchOffset
-            val isNearCurrentStream = (offset >= prefetchOffset - 64 * 1024L) &&
-                    (offset <= prefetchOffset + 768 * 1024L)
-
-            if (isNearCurrentStream) {
-                // Background prefetcher is downloading this region; wait for bytes to arrive
-                val targetBytes = if (session.isHighRes) minOf(maxPossible.toLong(), 65536L) else minOf(maxPossible.toLong(), 16384L)
-                session.waitForOffset(offset, targetBytes, 3500L)
-            } else {
-                // Non-contiguous read (FLAC seekpoint, audio start jump, or user seek).
-                // Immediately reposition the background prefetcher to offset!
-                Log.d(TAG, "[$trackId] Non-contiguous read at $offset (prefetcher at $prefetchOffset). Repositioning prefetcher!")
-                session.startPrefetchStream(offset)
-                val fetchLen = if (session.isHighRes) 2097152L else 1048576L
-                session.fetchDirectRange(offset, fetchLen)
+            // Check if download stream needs to jump to this seek position
+            val currentDl = session.currentDownloadOffset
+            val isSeek = offset < currentDl - 128 * 1024L || offset > currentDl + 2 * 1024 * 1024L
+            if (isSeek) {
+                Log.d(TAG, "[$trackId] Seek jump: read at $offset (downloader at $currentDl). Repositioning stream.")
+                session.startDownloadStream(offset)
             }
+            // Wait for bytes to arrive at offset
+            session.waitForBytes(offset, minBytes = 1L, timeoutMs = 15000L)
         }
 
-        // 3. Read whatever has arrived
-        var availAfterWait = session.intervals.getAvailableLengthFrom(offset)
-        if (availAfterWait <= 0 && (totalSize <= 0 || offset < totalSize)) {
-            // Safety fallback: if wait didn't produce bytes, directly fetch range right now
-            val fallbackLen = if (session.isHighRes) 1048576L else 262144L
-            session.fetchDirectRange(offset, fallbackLen)
-            availAfterWait = session.intervals.getAvailableLengthFrom(offset)
-        }
-
+        // 3. Read available bytes after wait
+        val availAfterWait = session.intervals.getAvailableLengthFrom(offset)
         if (availAfterWait > 0) {
             val toRead = minOf(maxPossible.toLong(), availAfterWait).toInt()
             val n = readChannel.read(ByteBuffer.wrap(data, 0, toRead), offset)
             val readBytes = if (n > 0) n else 0
             if (readBytes > 0) {
                 lastReadEnd = offset + readBytes
-                sequentialBytesRead += readBytes
-                checkPrefetcherReposition(lastReadEnd)
+                checkSeekReposition(lastReadEnd)
             }
             return readBytes
         }
 
-        Log.w(TAG, "[$trackId] onRead timeout or EOF at offset $offset (requested $size bytes, total=$totalSize)")
-        return 0
+        // 4. Underrun: never return 0 when offset < totalSize to avoid premature EOF cutoffs
+        if (totalSize > 0 && offset >= totalSize) {
+            return 0
+        }
+
+        Log.w(TAG, "[$trackId] Read underrun at offset $offset (requested $size bytes, total=$totalSize)")
+        throw ErrnoException("onRead", OsConstants.EAGAIN)
     }
 
-    private fun checkPrefetcherReposition(currentPos: Long) {
+    private fun checkSeekReposition(currentPos: Long) {
         if (session.totalSizeBytes > 0 && currentPos >= session.totalSizeBytes) return
-        // Don't reposition if the track is already fully downloaded
         if (session.totalSizeBytes > 0 && session.intervals.contains(0, session.totalSizeBytes)) return
 
-        // Never reposition on end-of-file metadata probes
-        if (session.totalSizeBytes > 1024 * 1024L && currentPos >= session.totalSizeBytes - 1024 * 1024L) return
-
-        if (currentPos >= session.audioStartOffset) {
-            val prefetchOffset = session.currentPrefetchOffset
-            val playbackAheadOfPrefetcher = currentPos > prefetchOffset + 768 * 1024L
-            val backwardSeek = currentPos < prefetchOffset - 1024 * 1024L &&
-                    session.intervals.getAvailableLengthFrom(currentPos) <= 0
-            if (playbackAheadOfPrefetcher || backwardSeek) {
-                Log.d(TAG, "[$trackId] Playback at $currentPos, prefetcher at $prefetchOffset, repositioning (ahead=$playbackAheadOfPrefetcher, backward=$backwardSeek)")
-                session.startPrefetchStream(currentPos)
-            }
+        val currentDl = session.currentDownloadOffset
+        // Only reposition if reading more than 2MB ahead of the active download worker and not cached
+        if (currentPos > currentDl + 2 * 1024 * 1024L && session.intervals.getAvailableLengthFrom(currentPos) <= 0) {
+            Log.d(TAG, "[$trackId] Playback outpaced downloader ($currentPos > $currentDl + 2MB). Repositioning stream.")
+            session.startDownloadStream(currentPos)
         }
     }
 
@@ -233,30 +201,14 @@ class ProxyStreamHandler(
         private var wakeLock: PowerManager.WakeLock? = null
 
         @Volatile var isReleased = false
-        @Volatile var currentPrefetchOffset: Long = 0L
+        @Volatile var currentDownloadOffset: Long = 0L
         @Volatile var streamingError = false
-        private var streamingJob: Job? = null
-        @Volatile private var currentStreamResponse: Response? = null
-
-        @Volatile var headerInfo: MediaHeaderInfo = MediaHeaderInfo(
-            audioStartOffset = 0L,
-            isHighRes = totalSizeBytes > 40 * 1024 * 1024L,
-            sampleRate = 44100,
-            bitsPerSample = 16,
-            container = "unknown"
-        )
-
-        val isHighRes: Boolean
-            get() = headerInfo.isHighRes || totalSizeBytes > 40 * 1024 * 1024L
-
-        val audioStartOffset: Long
-            get() = headerInfo.audioStartOffset
+        private var downloadJob: Job? = null
+        @Volatile private var currentResponse: Response? = null
+        private var cleanupJob: Job? = null
 
         init {
             val isFullyCached = runBlocking { cacheManager.isTrackFullyCached(trackId) }
-            if (!isFullyCached && cacheFile.exists()) {
-                cacheFile.delete()
-            }
             if (!cacheFile.exists()) {
                 cacheFile.createNewFile()
             }
@@ -267,205 +219,182 @@ class ProxyStreamHandler(
                 val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
                 pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "JellyfinAudioProvider:Session-$trackId")?.apply {
                     setReferenceCounted(false)
-                    acquire(10 * 60 * 1000L)
+                    acquire(15 * 60 * 1000L)
                 }
             } catch (_: Exception) {
                 null
             }
 
-            // Stream session initialized
-
-            // 1. Probe total size if not set
             if (totalSizeBytes <= 0) {
                 probeTotalSize()
             }
 
-            // 2. Fetch initial 64 KB synchronously to parse metadata / artwork headers
-            val initialHeaderBytes = minOf(65536L, if (totalSizeBytes > 0) totalSizeBytes else 65536L)
-            fetchDirectRange(0L, initialHeaderBytes)
-
-            // 3. Parse header to detect embedded artwork size, audio start offset, and audio resolution
-            val avail = intervals.getAvailableLengthFrom(0L)
-            if (avail >= 4) {
-                val readLen = minOf(avail, 65536L).toInt()
-                val headerBytes = ByteArray(readLen)
-                synchronized(writeLock) {
-                    writeRaf.seek(0)
-                    writeRaf.readFully(headerBytes)
+            if (isFullyCached) {
+                val fileLen = cacheFile.length()
+                if (fileLen > 0) {
+                    totalSizeBytes = fileLen
+                    intervals.add(0L, fileLen)
                 }
-                headerInfo = parseHeaderInfo(headerBytes, readLen, totalSizeBytes)
-                Log.i(TAG, "[$trackId] Parsed header: container=${headerInfo.container}, audioStart=${headerInfo.audioStartOffset}, hiRes=${headerInfo.isHighRes} (${headerInfo.sampleRate}Hz/${headerInfo.bitsPerSample}bit)")
-            }
-
-            // 4. Start prefetch stream:
-            // If massive artwork detected (> 256 KB, e.g. 14MB vinyl picture), jump prefetcher directly to audio stream!
-            if (headerInfo.audioStartOffset > 256 * 1024L && (totalSizeBytes <= 0 || headerInfo.audioStartOffset < totalSizeBytes)) {
-                Log.i(TAG, "[$trackId] Massive embedded artwork (${headerInfo.audioStartOffset / 1024} KB). Directing background prefetcher directly to audio stream at ${headerInfo.audioStartOffset}!")
-                startPrefetchStream(headerInfo.audioStartOffset)
             } else {
-                val startPos = minOf(intervals.getAvailableLengthFrom(0L), 65536L)
-                startPrefetchStream(startPos)
+                startDownloadStream(0L)
             }
         }
 
-        fun waitForOffset(offset: Long, targetBytes: Long, timeoutMs: Long) {
+        fun scheduleGracefulCleanup(delayMs: Long, onExpire: () -> Unit) {
+            synchronized(this) {
+                cleanupJob?.cancel()
+                cleanupJob = scope.launch {
+                    delay(delayMs)
+                    onExpire()
+                }
+            }
+        }
+
+        fun cancelGracefulCleanup() {
+            synchronized(this) {
+                cleanupJob?.cancel()
+                cleanupJob = null
+            }
+        }
+
+        fun waitForBytes(offset: Long, minBytes: Long = 1L, timeoutMs: Long = 15000L): Boolean {
             val deadline = System.currentTimeMillis() + timeoutMs
             synchronized(streamLock) {
-                while (!isReleased && !streamingError && System.currentTimeMillis() < deadline) {
+                while (!isReleased && System.currentTimeMillis() < deadline) {
                     val available = intervals.getAvailableLengthFrom(offset)
-                    val target = if (totalSizeBytes > 0) minOf(totalSizeBytes - offset, targetBytes) else targetBytes
-                    if (available >= target) break
-                    if (totalSizeBytes > 0 && offset + available >= totalSizeBytes) break
+                    val target = if (totalSizeBytes > 0) minOf(totalSizeBytes - offset, minBytes) else minBytes
+                    if (available >= target) return true
+                    if (totalSizeBytes > 0 && offset + available >= totalSizeBytes) return true
+                    if (streamingError) return false
                     try {
-                        (streamLock as Object).wait(50)
+                        (streamLock as Object).wait(100)
                     } catch (_: InterruptedException) {
-                        break
+                        return false
                     }
                 }
+                return intervals.getAvailableLengthFrom(offset) >= minBytes
             }
-        }
-
-        fun waitForWarmup(targetBytes: Long, timeoutMs: Long) {
-            waitForOffset(0L, targetBytes, timeoutMs)
-            Log.d(TAG, "[$trackId] Warmup finished: ${intervals.getAvailableLengthFrom(0L)} bytes ready")
         }
 
         @Synchronized
-        fun startPrefetchStream(offset: Long) {
+        fun startDownloadStream(offset: Long) {
             if (isReleased) return
 
-            // Abort previous blocking socket read immediately
             try {
-                currentStreamResponse?.close()
+                currentResponse?.close()
             } catch (_: Exception) {}
-            currentStreamResponse = null
+            currentResponse = null
 
-            streamingJob?.cancel()
-            currentPrefetchOffset = offset
+            downloadJob?.cancel()
+            currentDownloadOffset = offset
             streamingError = false
 
-            streamingJob = scope.launch {
-                try {
-                    var fetchOffset = offset
+            downloadJob = scope.launch {
+                var fetchOffset = offset
+                var consecutiveErrors = 0
+                val maxRetries = 5
 
-                    while (isActive && !isReleased) {
-                        val alreadyAvail = intervals.getAvailableLengthFrom(fetchOffset)
-                        if (alreadyAvail > 0) {
-                            fetchOffset += alreadyAvail
-                            if (totalSizeBytes > 0 && fetchOffset >= totalSizeBytes) {
-                                if (!intervals.contains(0, totalSizeBytes)) {
-                                    val missing = intervals.getFirstMissingRange(totalSizeBytes)
-                                    if (missing != null && isActive && !isReleased) {
-                                        fetchOffset = missing.first
-                                        continue
-                                    }
-                                }
-                                break
-                            }
-                            continue
-                        }
-
-                        Log.d(TAG, "[$trackId] Opening prefetch stream at offset $fetchOffset")
-                        val response = client.openAudioByteStream(trackId, fetchOffset)
-                        currentStreamResponse = response
-
-                        try {
-                            if (!response.isSuccessful && response.code != 206) {
-                                Log.w(TAG, "[$trackId] Stream request failed (HTTP ${response.code})")
-                                streamingError = true
-                                synchronized(streamLock) {
-                                    (streamLock as Object).notifyAll()
-                                }
-                                break
-                            }
-
-                            streamingError = false
-
-                            val cr = response.header("Content-Range")
-                            val totalFromRange = cr?.substringAfterLast('/')?.toLongOrNull()
-                            val cl = response.header("Content-Length")?.toLongOrNull()
-                            val serverTotal = totalFromRange ?: (if (fetchOffset == 0L && cl != null && cl > 0) cl else null)
-                            if (serverTotal != null && serverTotal > 0 && serverTotal != totalSizeBytes) {
-                                Log.d(TAG, "[$trackId] Server authoritative totalSizeBytes: $totalSizeBytes -> $serverTotal")
-                                totalSizeBytes = serverTotal
-                            }
-
-                            val rawStream = response.body?.byteStream() ?: break
-                            val stream = BufferedInputStream(rawStream, 256 * 1024)
-                            val buffer = ByteArray(128 * 1024)
-
-                            while (isActive && !isReleased) {
-                                val read = stream.read(buffer)
-                                if (read <= 0) {
-                                    // Server finished sending data for this stream
-                                    if (totalSizeBytes <= 0) {
-                                        Log.i(TAG, "[$trackId] Server reached EOF at offset $fetchOffset (was totalSizeBytes=$totalSizeBytes)")
-                                        totalSizeBytes = fetchOffset
-                                    }
-                                    if (totalSizeBytes > 0 && intervals.contains(0, totalSizeBytes)) {
-                                        markTrackFullyCached()
-                                    }
-                                    break
-                                }
-
-                                synchronized(writeLock) {
-                                    val bb = ByteBuffer.wrap(buffer, 0, read)
-                                    var pos = fetchOffset
-                                    while (bb.hasRemaining()) {
-                                        val written = writeChannel.write(bb, pos)
-                                        if (written <= 0) break
-                                        pos += written
-                                    }
-                                }
-
-                                synchronized(streamLock) {
-                                    intervals.add(fetchOffset, fetchOffset + read)
-                                    (streamLock as Object).notifyAll()
-                                }
-                                fetchOffset += read
-                                currentPrefetchOffset = fetchOffset
-
-                                if (totalSizeBytes > 0 && intervals.contains(0, totalSizeBytes)) {
-                                    markTrackFullyCached()
-                                    return@launch
-                                }
-                            }
-                        } finally {
-                            try {
-                                response.close()
-                            } catch (_: Exception) {}
-                            // Only clear if it's still OUR response (avoid race with new coroutine)
-                            if (currentStreamResponse === response) {
-                                currentStreamResponse = null
-                            }
-                        }
-
+                while (isActive && !isReleased) {
+                    val alreadyAvail = intervals.getAvailableLengthFrom(fetchOffset)
+                    if (alreadyAvail > 0) {
+                        fetchOffset += alreadyAvail
+                        currentDownloadOffset = fetchOffset
                         if (totalSizeBytes > 0 && fetchOffset >= totalSizeBytes) {
-                            if (!intervals.contains(0, totalSizeBytes)) {
-                                val missing = intervals.getFirstMissingRange(totalSizeBytes)
-                                if (missing != null && isActive && !isReleased) {
-                                    Log.d(TAG, "[$trackId] Audio stream reached EOF, backfilling missing gap: ${missing.first}..${missing.second}")
-                                    fetchOffset = missing.first
-                                    continue
+                            checkAndMarkFullyCached()
+                            break
+                        }
+                        continue
+                    }
+
+                    var response: Response? = null
+                    try {
+                        Log.d(TAG, "[$trackId] Opening download stream at offset $fetchOffset (attempt ${consecutiveErrors + 1})")
+                        response = client.openAudioByteStream(trackId, fetchOffset)
+                        currentResponse = response
+
+                        if (!response.isSuccessful && response.code != 206) {
+                            Log.w(TAG, "[$trackId] Stream request returned HTTP ${response.code}")
+                            if (response.code == 416) {
+                                probeTotalSize()
+                                break
+                            }
+                            throw IOException("HTTP ${response.code}: ${response.message}")
+                        }
+
+                        consecutiveErrors = 0
+                        streamingError = false
+
+                        val cr = response.header("Content-Range")
+                        val totalFromRange = cr?.substringAfterLast('/')?.toLongOrNull()
+                        val cl = response.header("Content-Length")?.toLongOrNull()
+                        val serverTotal = totalFromRange ?: (if (fetchOffset == 0L && cl != null && cl > 0) cl else null)
+                        if (serverTotal != null && serverTotal > 0 && serverTotal != totalSizeBytes) {
+                            totalSizeBytes = serverTotal
+                        }
+
+                        val rawStream = response.body?.byteStream() ?: throw IOException("Empty response body")
+                        val stream = BufferedInputStream(rawStream, 256 * 1024)
+                        val buffer = ByteArray(128 * 1024)
+
+                        while (isActive && !isReleased) {
+                            val read = stream.read(buffer)
+                            if (read <= 0) {
+                                if (totalSizeBytes <= 0) {
+                                    totalSizeBytes = fetchOffset
+                                }
+                                checkAndMarkFullyCached()
+                                return@launch
+                            }
+
+                            synchronized(writeLock) {
+                                val bb = ByteBuffer.wrap(buffer, 0, read)
+                                var pos = fetchOffset
+                                while (bb.hasRemaining()) {
+                                    val written = writeChannel.write(bb, pos)
+                                    if (written <= 0) break
+                                    pos += written
                                 }
                             }
+
+                            synchronized(streamLock) {
+                                intervals.add(fetchOffset, fetchOffset + read)
+                                (streamLock as Object).notifyAll()
+                            }
+
+                            fetchOffset += read
+                            currentDownloadOffset = fetchOffset
+
                             if (totalSizeBytes > 0 && intervals.contains(0, totalSizeBytes)) {
-                                markTrackFullyCached()
+                                checkAndMarkFullyCached()
+                                return@launch
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) {
+                            break
+                        }
+                        consecutiveErrors++
+                        Log.w(TAG, "[$trackId] Stream error at $fetchOffset (retry $consecutiveErrors/$maxRetries): ${e.message}")
+
+                        if (consecutiveErrors >= maxRetries) {
+                            Log.e(TAG, "[$trackId] Max stream retries reached at $fetchOffset. Signaling stream error.")
+                            streamingError = true
+                            synchronized(streamLock) {
+                                (streamLock as Object).notifyAll()
                             }
                             break
                         }
-                    }
-                } catch (e: Exception) {
-                    if (e !is CancellationException && !isReleased && isActive) {
-                        Log.w(TAG, "[$trackId] Prefetch stream error at offset $offset: ${e.message}", e)
-                        streamingError = true
-                        synchronized(streamLock) {
-                            (streamLock as Object).notifyAll()
+
+                        val delayMs = (500L * (1L shl (consecutiveErrors - 1))).coerceAtMost(5000L)
+                        delay(delayMs)
+                    } finally {
+                        try {
+                            response?.close()
+                        } catch (_: Exception) {}
+                        if (currentResponse === response) {
+                            currentResponse = null
                         }
                     }
-                } finally {
-                    // Don't close currentStreamResponse here — it may belong to a new coroutine.
-                    // Each response is already closed by its inner finally block above.
                 }
             }
         }
@@ -486,18 +415,12 @@ class ProxyStreamHandler(
                 if (intervals.getAvailableLengthFrom(start) >= needed) return
 
                 try {
-                    Log.d(TAG, "[$trackId] Single-shot direct range fetch $start..$endInclusive")
+                    Log.d(TAG, "[$trackId] Direct range fetch: $start..$endInclusive")
                     client.openAudioByteStream(trackId, start, endInclusive).use { response ->
                         if (!response.isSuccessful && response.code != 206) {
-                            Log.w(TAG, "[$trackId] fetchDirectRange HTTP ${response.code} ($start..$endInclusive)")
+                            Log.w(TAG, "[$trackId] Direct range fetch HTTP ${response.code}")
                             if (response.code == 416) {
-                                val cr = response.header("Content-Range")
-                                val total = cr?.substringAfterLast('/')?.toLongOrNull()
-                                if (total != null && total > 0) {
-                                    totalSizeBytes = total
-                                } else if (totalSizeBytes <= 0 || start < totalSizeBytes) {
-                                    totalSizeBytes = start
-                                }
+                                probeTotalSize()
                             }
                             return
                         }
@@ -529,10 +452,9 @@ class ProxyStreamHandler(
                             }
                             current += read
                         }
-                        Log.d(TAG, "[$trackId] Direct range complete: $start to $current")
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "[$trackId] fetchDirectRange failed ($start-$endInclusive): ${e.message}")
+                    Log.w(TAG, "[$trackId] Direct range fetch exception ($start..$endInclusive): ${e.message}")
                 }
             }
         }
@@ -551,17 +473,19 @@ class ProxyStreamHandler(
             }
         }
 
-        private fun markTrackFullyCached() {
-            scope.launch {
-                try {
-                    db.trackDao().updateCacheStatus(
-                        id = trackId,
-                        isFullyCached = true,
-                        cachedBytes = totalSizeBytes
-                    )
-                    Log.i(TAG, "[$trackId] Track fully downloaded ($totalSizeBytes bytes) and cached on disk.")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to update cache status in DB", e)
+        private fun checkAndMarkFullyCached() {
+            if (totalSizeBytes > 0 && intervals.contains(0, totalSizeBytes)) {
+                scope.launch {
+                    try {
+                        db.trackDao().updateCacheStatus(
+                            id = trackId,
+                            isFullyCached = true,
+                            cachedBytes = totalSizeBytes
+                        )
+                        Log.i(TAG, "[$trackId] Track fully downloaded ($totalSizeBytes bytes) and cached on disk.")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to update cache status in DB", e)
+                    }
                 }
             }
         }
@@ -578,11 +502,12 @@ class ProxyStreamHandler(
             } catch (_: Exception) {}
 
             try {
-                currentStreamResponse?.close()
+                currentResponse?.close()
             } catch (_: Exception) {}
-            currentStreamResponse = null
+            currentResponse = null
 
-            streamingJob?.cancel()
+            cleanupJob?.cancel()
+            downloadJob?.cancel()
             scope.cancel()
 
             synchronized(streamLock) {
@@ -594,8 +519,6 @@ class ProxyStreamHandler(
                 writeRaf.close()
             } catch (e: Exception) {
                 Log.w(TAG, "Error closing session write channel", e)
-            } finally {
-                // Session stopped
             }
         }
     }
@@ -603,6 +526,10 @@ class ProxyStreamHandler(
     companion object {
         private const val TAG = "ProxyStreamHandler"
         private val activeSessions = ConcurrentHashMap<String, TrackSession>()
+
+        fun isSessionActive(trackId: String): Boolean {
+            return activeSessions.containsKey(trackId)
+        }
 
         @Synchronized
         internal fun getOrCreateSession(
@@ -615,6 +542,7 @@ class ProxyStreamHandler(
         ): TrackSession {
             val existing = activeSessions[trackId]
             if (existing != null && !existing.isReleased) {
+                existing.cancelGracefulCleanup()
                 existing.refCount.incrementAndGet()
                 if (existing.totalSizeBytes <= 0 && totalSizeBytes > 0) {
                     existing.totalSizeBytes = totalSizeBytes
@@ -644,89 +572,16 @@ class ProxyStreamHandler(
             val count = session.refCount.decrementAndGet()
             Log.d(TAG, "[$trackId] Session release called (remaining refCount=$count)")
             if (count <= 0) {
-                activeSessions.remove(trackId)
-                session.close()
-            }
-        }
-
-        data class MediaHeaderInfo(
-            val audioStartOffset: Long,
-            val isHighRes: Boolean,
-            val sampleRate: Int,
-            val bitsPerSample: Int,
-            val container: String
-        )
-
-        internal fun parseHeaderInfo(data: ByteArray, length: Int, totalSizeBytes: Long): MediaHeaderInfo {
-            if (length >= 4 && data[0] == 0x66.toByte() && data[1] == 0x4C.toByte() && data[2] == 0x61.toByte() && data[3] == 0x43.toByte()) {
-                // FLAC container ("fLaC")
-                var pos = 4
-                var sampleRate = 44100
-                var bitsPerSample = 16
-                var audioStart = 4L
-                while (pos + 4 <= length) {
-                    val hdr = data[pos].toInt() and 0xFF
-                    val isLast = (hdr and 0x80) != 0
-                    val blockType = hdr and 0x7F
-                    val blockLen = ((data[pos + 1].toInt() and 0xFF) shl 16) or
-                            ((data[pos + 2].toInt() and 0xFF) shl 8) or
-                            (data[pos + 3].toInt() and 0xFF)
-
-                    if (blockType == 0 && pos + 4 + minOf(blockLen, 34) <= length) {
-                        // STREAMINFO block:
-                        // Byte 10: sample rate high [19..12]
-                        // Byte 11: sample rate mid [11..4]
-                        // Byte 12: sample rate low [3..0] (top 4 bits), bits per sample top bit
-                        // Byte 13: bits per sample [3..0] (top 4 bits)
-                        if (pos + 4 + 18 <= length) {
-                            val b10 = data[pos + 4 + 10].toInt() and 0xFF
-                            val b11 = data[pos + 4 + 11].toInt() and 0xFF
-                            val b12 = data[pos + 4 + 12].toInt() and 0xFF
-                            val b13 = data[pos + 4 + 13].toInt() and 0xFF
-                            sampleRate = (b10 shl 12) or (b11 shl 4) or (b12 ushr 4)
-                            bitsPerSample = (((b12 and 0x01) shl 4) or (b13 ushr 4)) + 1
+                session.scheduleGracefulCleanup(30_000L) {
+                    synchronized(Companion) {
+                        if (session.refCount.get() <= 0) {
+                            activeSessions.remove(trackId)
+                            session.close()
+                            Log.d(TAG, "[$trackId] Session disposed after grace period.")
                         }
                     }
-
-                    pos += 4 + blockLen
-                    audioStart = pos.toLong()
-                    if (isLast) break
                 }
-                val isHiRes = sampleRate >= 88200 || bitsPerSample > 16 || totalSizeBytes > 40 * 1024 * 1024L
-                return MediaHeaderInfo(
-                    audioStartOffset = audioStart,
-                    isHighRes = isHiRes,
-                    sampleRate = sampleRate,
-                    bitsPerSample = bitsPerSample,
-                    container = "flac"
-                )
-            } else if (length >= 10 && data[0] == 0x49.toByte() && data[1] == 0x44.toByte() && data[2] == 0x33.toByte()) {
-                // ID3v2 tag ("ID3")
-                val flags = data[5].toInt() and 0xFF
-                val tagSize = ((data[6].toInt() and 0x7F) shl 21) or
-                        ((data[7].toInt() and 0x7F) shl 14) or
-                        ((data[8].toInt() and 0x7F) shl 7) or
-                        (data[9].toInt() and 0x7F)
-                val hasFooter = (flags and 0x10) != 0
-                val audioStart = 10L + tagSize + (if (hasFooter) 10L else 0L)
-                val isHiRes = totalSizeBytes > 50 * 1024 * 1024L
-                return MediaHeaderInfo(
-                    audioStartOffset = audioStart,
-                    isHighRes = isHiRes,
-                    sampleRate = 44100,
-                    bitsPerSample = 16,
-                    container = "mp3"
-                )
             }
-
-            val isHiRes = totalSizeBytes > 40 * 1024 * 1024L
-            return MediaHeaderInfo(
-                audioStartOffset = 0L,
-                isHighRes = isHiRes,
-                sampleRate = 44100,
-                bitsPerSample = 16,
-                container = "unknown"
-            )
         }
     }
 }

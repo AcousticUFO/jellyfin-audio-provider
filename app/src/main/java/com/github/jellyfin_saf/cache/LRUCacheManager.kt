@@ -11,6 +11,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import com.github.jellyfin_saf.stream.ProxyStreamHandler
 
 /**
  * Automated LRU cache manager for streamed audio files.
@@ -101,6 +102,10 @@ class LRUCacheManager(private val context: Context) {
 
         val candidates = db.trackDao().getOldestCachedTracksExcludingFavorites()
         for (track in candidates) {
+            if (ProxyStreamHandler.isSessionActive(track.id)) {
+                Log.d(TAG, "Skipping active streaming session track from eviction: ${track.id}")
+                continue
+            }
             if (currentBytes - freedBytes <= targetSize) break
 
             try {
