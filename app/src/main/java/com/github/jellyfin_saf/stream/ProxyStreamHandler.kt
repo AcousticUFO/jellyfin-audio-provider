@@ -95,15 +95,19 @@ class ProxyStreamHandler(
         val maxPossible = if (totalSize > 0) minOf(size.toLong(), totalSize - offset).toInt() else size
         if (maxPossible <= 0) return 0
 
+        // In POSIX regular file I/O, read() never returns a short read unless EOF is reached.
+        // Returning fewer bytes than requested causes native audio demuxers (like FFmpeg in Poweramp)
+        // to parse truncated packet headers, resulting in "invalid residual" / premature EOF decode failures.
+        val minWaitBytes = maxPossible.toLong()
+
         // 1. Fast path: data is already available locally on disk
         val available = session.intervals.getAvailableLengthFrom(offset)
-        if (available > 0) {
+        if (available >= minWaitBytes || (totalSize > 0 && offset + available >= totalSize)) {
             val toRead = minOf(maxPossible.toLong(), available).toInt()
             val n = readChannel.read(ByteBuffer.wrap(data, 0, toRead), offset)
             val readBytes = if (n > 0) n else 0
             if (readBytes > 0) {
                 lastReadEnd = offset + readBytes
-                checkSeekReposition(lastReadEnd)
             }
             return readBytes
         }
@@ -121,42 +125,39 @@ class ProxyStreamHandler(
                 Log.d(TAG, "[$trackId] Seek jump: read at $offset (downloader at $currentDl). Repositioning stream.")
                 session.startDownloadStream(offset)
             }
-            // Wait for bytes to arrive at offset
-            session.waitForBytes(offset, minBytes = 1L, timeoutMs = 15000L)
+            // Wait for sufficient bytes to arrive at offset
+            session.waitForBytes(offset, minBytes = minWaitBytes, timeoutMs = 15000L)
         }
 
-        // 3. Read available bytes after wait
-        val availAfterWait = session.intervals.getAvailableLengthFrom(offset)
-        if (availAfterWait > 0) {
+        // 3. Fallback: if stream wait was insufficient or timed out, fetch via direct range
+        var availAfterWait = session.intervals.getAvailableLengthFrom(offset)
+        if (availAfterWait < minWaitBytes && (totalSize <= 0 || offset + availAfterWait < totalSize)) {
+            val needed = if (totalSize > 0) minOf(minWaitBytes, totalSize - offset) else minWaitBytes
+            val fetchStart = offset + availAfterWait
+            val fetchLen = needed - availAfterWait
+            Log.d(TAG, "[$trackId] Stream wait underrun ($availAfterWait < $needed at $offset). Triggering direct range fetch at $fetchStart (len $fetchLen).")
+            session.fetchDirectRange(fetchStart, fetchLen)
+            availAfterWait = session.intervals.getAvailableLengthFrom(offset)
+        }
+
+        // 4. Read available bytes after wait / fallback fetch
+        if (availAfterWait >= minWaitBytes || (totalSize > 0 && offset + availAfterWait >= totalSize)) {
             val toRead = minOf(maxPossible.toLong(), availAfterWait).toInt()
             val n = readChannel.read(ByteBuffer.wrap(data, 0, toRead), offset)
             val readBytes = if (n > 0) n else 0
             if (readBytes > 0) {
                 lastReadEnd = offset + readBytes
-                checkSeekReposition(lastReadEnd)
             }
             return readBytes
         }
 
-        // 4. Underrun: never return 0 when offset < totalSize to avoid premature EOF cutoffs
+        // 5. Underrun: never return 0 when offset < totalSize to avoid premature EOF cutoffs
         if (totalSize > 0 && offset >= totalSize) {
             return 0
         }
 
-        Log.w(TAG, "[$trackId] Read underrun at offset $offset (requested $size bytes, total=$totalSize)")
+        Log.w(TAG, "[$trackId] Read underrun at offset $offset (requested $size bytes, avail=$availAfterWait, total=$totalSize)")
         throw ErrnoException("onRead", OsConstants.EAGAIN)
-    }
-
-    private fun checkSeekReposition(currentPos: Long) {
-        if (session.totalSizeBytes > 0 && currentPos >= session.totalSizeBytes) return
-        if (session.totalSizeBytes > 0 && session.intervals.contains(0, session.totalSizeBytes)) return
-
-        val currentDl = session.currentDownloadOffset
-        // Only reposition if reading more than 2MB ahead of the active download worker and not cached
-        if (currentPos > currentDl + 2 * 1024 * 1024L && session.intervals.getAvailableLengthFrom(currentPos) <= 0) {
-            Log.d(TAG, "[$trackId] Playback outpaced downloader ($currentPos > $currentDl + 2MB). Repositioning stream.")
-            session.startDownloadStream(currentPos)
-        }
     }
 
     override fun onRelease() {
