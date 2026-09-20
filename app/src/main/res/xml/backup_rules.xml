@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cloud backup exclusion rules (API < 31) -->
+<full-backup-content>
+    <!-- Exclude sensitive encrypted credentials -->
+    <exclude domain="sharedpref" path="secure_credentials.xml" />
+    <exclude domain="sharedpref" path="server_config.xml" />
+    <!-- Exclude SQLite databases -->
+    <exclude domain="database" path="." />
+    <!-- Exclude cached media files -->
+    <exclude domain="file" path="jellyfin_tracks" />
+    <exclude domain="file" path="jellyfin_thumbs" />
+</full-backup-content>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Jellyfin Audio Provider</string>
+    <string name="documents_authority">com.github.jellyfin_saf.documents</string>
+    <string name="root_title">Jellyfin Music</string>
+    <string name="root_summary">Your remote Jellyfin music collection</string>
+    <string name="sync_channel_name">Library Sync</string>
+    <string name="sync_channel_desc">Shows progress while syncing your Jellyfin music library</string>
+</resources>
