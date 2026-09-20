@@ -90,7 +90,8 @@ sealed class DocumentId {
                         }
                     }
 
-                    if (dir.contains("..") || dir.contains('\u0000')) {
+                    val segments = dir.split('/', '\\')
+                    if (dir.contains('\u0000') || segments.any { it.trim() == ".." || it.trim() == "." }) {
                         throw IllegalArgumentException("Invalid folder document ID: path traversal detected")
                     }
                     Folder(dir)
