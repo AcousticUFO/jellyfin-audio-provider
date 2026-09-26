@@ -54,7 +54,7 @@ class StreamingService : Service() {
                 startForeground(
                     NOTIFICATION_ID,
                     notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
                 )
             } else {
                 startForeground(NOTIFICATION_ID, notification)

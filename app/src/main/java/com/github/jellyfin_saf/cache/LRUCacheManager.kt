@@ -47,6 +47,21 @@ class LRUCacheManager(private val context: Context) {
     }
 
     /**
+     * Safely deletes the cache file for a specific track, if it exists on disk.
+     */
+    fun evictTrack(trackId: String) {
+        try {
+            val file = getTrackFile(trackId)
+            if (file.exists()) {
+                file.delete()
+                Log.d(TAG, "Evicted cache file for track $trackId")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to evict cache file for $trackId", e)
+        }
+    }
+
+    /**
      * Safely retrieves the cache file for an album thumbnail.
      */
     fun getThumbnailFile(albumId: String): File {

@@ -75,6 +75,12 @@ interface TrackDao {
     @Query("DELETE FROM tracks WHERE id = :id")
     suspend fun deleteTrack(id: String)
 
+    @Query("SELECT id FROM tracks")
+    suspend fun getAllTrackIds(): List<String>
+
+    @Query("DELETE FROM tracks WHERE id IN (:ids)")
+    suspend fun deleteTracksByIds(ids: List<String>)
+
     @Query("UPDATE tracks SET cachedBytes = 0, isFullyCached = 0 WHERE isFavorite = 0")
     suspend fun clearNonFavoriteCaches()
 

@@ -9,6 +9,7 @@ import android.os.CancellationSignal
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsProvider
@@ -80,7 +81,7 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
         synchronized(proxyThreads) {
             if (proxyThreads.isEmpty()) {
                 for (i in 0 until 8) {
-                    val thread = HandlerThread("JellyfinProxyThread-$i")
+                    val thread = HandlerThread("JellyfinProxyThread-$i", Process.THREAD_PRIORITY_AUDIO)
                     thread.start()
                     proxyThreads.add(thread)
                     proxyHandlers.add(Handler(thread.looper))
@@ -545,6 +546,15 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
 
         fun invalidateCache() {
             instance?.subfolderMap = null
+            try {
+                val ctx = instance?.context
+                if (ctx != null) {
+                    val rootUri = DocumentsContract.buildRootsUri(ctx.getString(R.string.documents_authority))
+                    ctx.contentResolver.notifyChange(rootUri, null)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to notify root change", e)
+            }
         }
 
         private val DEFAULT_ROOT_PROJECTION = arrayOf(

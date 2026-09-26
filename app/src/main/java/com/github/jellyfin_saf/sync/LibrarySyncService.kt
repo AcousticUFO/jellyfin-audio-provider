@@ -15,6 +15,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.github.jellyfin_saf.R
 import com.github.jellyfin_saf.api.JellyfinClient
+import com.github.jellyfin_saf.cache.LRUCacheManager
 import com.github.jellyfin_saf.db.AppDatabase
 import com.github.jellyfin_saf.db.TrackEntity
 import com.github.jellyfin_saf.ui.MainActivity
@@ -71,6 +72,7 @@ class LibrarySyncService : Service() {
             val libraryRoots = client.getLibraryRoots()
             Log.i(TAG, "Fetched ${libraryRoots.size} library roots: $libraryRoots")
 
+            val syncedTrackIds = HashSet<String>(if (totalCount > 0) totalCount else 20000)
             var startIndex = 0
             var totalSynced = 0
 
@@ -79,6 +81,7 @@ class LibrarySyncService : Service() {
                 if (batch.isEmpty()) break
 
                 val entities = batch.map { track ->
+                    syncedTrackIds.add(track.id)
                     val (relDir, fileName) = track.calculateRelativePath(libraryRoots)
                     TrackEntity(
                         id = track.id,
@@ -115,6 +118,20 @@ class LibrarySyncService : Service() {
                 updateNotification(totalSynced, totalCount)
 
                 if (batch.size < BATCH_SIZE) break
+            }
+
+            // Reconcile and prune obsolete tracks (deleted, renamed, or retagged on Jellyfin)
+            val existingTrackIds = db.trackDao().getAllTrackIds().toSet()
+            val obsoleteTrackIds = existingTrackIds - syncedTrackIds
+            if (obsoleteTrackIds.isNotEmpty()) {
+                Log.i(TAG, "Reconciling library: purging ${obsoleteTrackIds.size} obsolete tracks from local database")
+                val cacheManager = LRUCacheManager(applicationContext)
+                obsoleteTrackIds.chunked(500).forEach { chunk ->
+                    db.trackDao().deleteTracksByIds(chunk)
+                    for (id in chunk) {
+                        cacheManager.evictTrack(id)
+                    }
+                }
             }
 
             val finalTrackCount = db.trackDao().getTotalTrackCount()
