@@ -252,6 +252,7 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     val topFolders = treeMap[""] ?: emptyList()
                     if (topFolders.isNotEmpty()) {
                         topFolders.forEach { folderName ->
+                            val hasSubdirs = treeMap[folderName]?.isNotEmpty() == true
                             result.newRow().apply {
                                 add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentId.forFolder(folderName))
                                 add(DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.MIME_TYPE_DIR)
@@ -260,6 +261,7 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                                     DocumentsContract.Document.COLUMN_FLAGS,
                                     DocumentsContract.Document.FLAG_DIR_PREFERS_GRID or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
                                 )
+                                add(POWERAMP_COLUMN_FLAGS, if (hasSubdirs) 1 else 2)
                             }
                         }
 
@@ -297,6 +299,7 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
 
                     subFolders.forEach { subFolder ->
                         val childRelativeDir = "$currentDir/$subFolder"
+                        val hasSubdirs = treeMap[childRelativeDir]?.isNotEmpty() == true
                         result.newRow().apply {
                             add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentId.forFolder(childRelativeDir))
                             add(DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.MIME_TYPE_DIR)
@@ -305,6 +308,7 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                                 DocumentsContract.Document.COLUMN_FLAGS,
                                 DocumentsContract.Document.FLAG_DIR_PREFERS_GRID or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
                             )
+                            add(POWERAMP_COLUMN_FLAGS, if (hasSubdirs) 1 else 2)
                         }
                     }
 
@@ -422,8 +426,6 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
             if (!lyrics.isNullOrBlank()) {
                 add(COLUMN_TRACK_LYRICS, lyrics)
             }
-
-            add(POWERAMP_COLUMN_FLAGS, 0x1)
         }
     }
 

@@ -68,9 +68,20 @@ class ProxyStreamHandler(
         if (session.totalSizeBytes <= 0) {
             session.probeTotalSize()
         }
-        // Wait up to 5 seconds for initial header bytes (64 KB) to be ready on disk
-        session.waitForBytes(0L, minBytes = 65536L, timeoutMs = 5000L)
+        // Wait up to 5 seconds for initial header bytes (256 KB) to be ready on disk for 24-bit Hi-Res headroom
+        session.waitForBytes(0L, minBytes = 262144L, timeoutMs = 5000L)
         cacheManager.onTrackAccessed(trackId)
+    }
+
+    private fun readFully(buffer: ByteArray, targetLen: Int, fileOffset: Long): Int {
+        val bb = ByteBuffer.wrap(buffer, 0, targetLen)
+        var pos = fileOffset
+        while (bb.hasRemaining()) {
+            val n = readChannel.read(bb, pos)
+            if (n <= 0) break
+            pos += n
+        }
+        return bb.position()
     }
 
     override fun onGetSize(): Long {
@@ -104,8 +115,7 @@ class ProxyStreamHandler(
         val available = session.intervals.getAvailableLengthFrom(offset)
         if (available >= minWaitBytes || (totalSize > 0 && offset + available >= totalSize)) {
             val toRead = minOf(maxPossible.toLong(), available).toInt()
-            val n = readChannel.read(ByteBuffer.wrap(data, 0, toRead), offset)
-            val readBytes = if (n > 0) n else 0
+            val readBytes = readFully(data, toRead, offset)
             if (readBytes > 0) {
                 lastReadEnd = offset + readBytes
             }
@@ -143,8 +153,7 @@ class ProxyStreamHandler(
         // 4. Read available bytes after wait / fallback fetch
         if (availAfterWait >= minWaitBytes || (totalSize > 0 && offset + availAfterWait >= totalSize)) {
             val toRead = minOf(maxPossible.toLong(), availAfterWait).toInt()
-            val n = readChannel.read(ByteBuffer.wrap(data, 0, toRead), offset)
-            val readBytes = if (n > 0) n else 0
+            val readBytes = readFully(data, toRead, offset)
             if (readBytes > 0) {
                 lastReadEnd = offset + readBytes
             }
