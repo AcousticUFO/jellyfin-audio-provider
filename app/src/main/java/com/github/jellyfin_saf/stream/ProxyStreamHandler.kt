@@ -32,12 +32,13 @@ import okhttp3.Response
 /**
  * Standardized, resilient virtual file streaming bridge between Jellyfin and Android SAF.
  *
- * Implements a robust VFS read-through sparse cache architecture:
- * - Decoupled lock-free positional FileChannel reads for zero-latency cache hits.
- * - Single continuous background streaming worker with transparent HTTP Range auto-reconnection.
- * - Non-blocking on-demand metadata footer retrieval without stream interruption.
+ * Implements a robust contiguous streaming and caching architecture:
+ * - Single unified FileChannel under strict thread and memory synchronization (fileLock).
+ * - Full-read guarantee: onRead loops and blocks until the exact requested buffer is filled or true EOF is reached.
+ * - Absolute prohibition of short reads and EAGAIN errors to prevent native FLAC decoder filter saturation (static noise bursts).
+ * - Clean sequential background downloader with automatic HTTP Range reconnect and exponential backoff.
+ * - Clean seek repositioning without creating sparse zero-holes.
  * - Session keep-alive grace period preventing premature cache deletion during player probe cycles.
- * - Strict POSIX EOF compliance: never returns 0 when offset < totalSizeBytes.
  */
 class ProxyStreamHandler(
     private val context: Context,
@@ -57,31 +58,17 @@ class ProxyStreamHandler(
         db = db
     )
 
-    private val readRaf: RandomAccessFile = RandomAccessFile(session.cacheFile, "r")
-    private val readChannel: FileChannel = readRaf.channel
-
     @Volatile
     private var isReleased = false
-    private var lastReadEnd = -1L
 
     init {
         if (session.totalSizeBytes <= 0) {
             session.probeTotalSize()
         }
-        // Wait up to 5 seconds for initial header bytes (256 KB) to be ready on disk for 24-bit Hi-Res headroom
-        session.waitForBytes(0L, minBytes = 262144L, timeoutMs = 5000L)
+        // Pre-buffer initial header bytes (512 KB) for instantaneous decoding and Hi-Res headroom
+        val initialPrebuffer = minOf(512 * 1024L, if (session.totalSizeBytes > 0) session.totalSizeBytes else 512 * 1024L)
+        session.ensureBytesAvailable(0L, initialPrebuffer.toInt(), timeoutMs = 10000L)
         cacheManager.onTrackAccessed(trackId)
-    }
-
-    private fun readFully(buffer: ByteArray, targetLen: Int, fileOffset: Long): Int {
-        val bb = ByteBuffer.wrap(buffer, 0, targetLen)
-        var pos = fileOffset
-        while (bb.hasRemaining()) {
-            val n = readChannel.read(bb, pos)
-            if (n <= 0) break
-            pos += n
-        }
-        return bb.position()
     }
 
     override fun onGetSize(): Long {
@@ -103,91 +90,42 @@ class ProxyStreamHandler(
             return 0
         }
 
-        val maxPossible = if (totalSize > 0) minOf(size.toLong(), totalSize - offset).toInt() else size
-        if (maxPossible <= 0) return 0
+        val targetLen = if (totalSize > 0) minOf(size.toLong(), totalSize - offset).toInt() else size
+        if (targetLen <= 0) return 0
 
-        // In POSIX regular file I/O, read() never returns a short read unless EOF is reached.
-        // Returning fewer bytes than requested causes native audio demuxers (like FFmpeg in Poweramp)
-        // to parse truncated packet headers, resulting in "invalid residual" / premature EOF decode failures.
-        val minWaitBytes = maxPossible.toLong()
-
-        // 1. Fast path: data is already available locally on disk
-        val available = session.intervals.getAvailableLengthFrom(offset)
-        if (available >= minWaitBytes || (totalSize > 0 && offset + available >= totalSize)) {
-            val toRead = minOf(maxPossible.toLong(), available).toInt()
-            val readBytes = readFully(data, toRead, offset)
-            if (readBytes > 0) {
-                lastReadEnd = offset + readBytes
+        // Android FUSE contract: onRead MUST return exactly targetLen bytes unless EOF is reached.
+        // Returning fewer bytes causes FUSE to signal premature EOF, corrupting the demuxer.
+        // Throwing EAGAIN on a regular file descriptor causes native audio decoders (FFmpeg in Poweramp)
+        // to treat the packet as corrupted, leading to explosive 0 dBFS white noise bursts.
+        val ready = session.ensureBytesAvailable(offset, targetLen, timeoutMs = 30000L)
+        if (!ready) {
+            if (session.streamingError) {
+                Log.e(TAG, "[$trackId] Unrecoverable stream error at offset $offset")
+                throw ErrnoException("onRead", OsConstants.EIO)
             }
-            return readBytes
+            Log.e(TAG, "[$trackId] Stream timeout waiting for $targetLen bytes at offset $offset")
+            throw ErrnoException("onRead", OsConstants.ETIMEDOUT)
         }
 
-        // 2. Cache miss: check if this is an end-of-file metadata probe (ID3v1, APE, FLAC seektable)
-        val isEndOfFileProbe = totalSize > 512 * 1024L && offset >= (totalSize - 512 * 1024L)
-        if (isEndOfFileProbe) {
-            val footerLen = minOf(totalSize - offset, 256 * 1024L)
-            session.fetchDirectRange(offset, footerLen)
-        } else {
-            // Check if download stream needs to jump to this seek position
-            val currentDl = session.currentDownloadOffset
-            val isSeek = offset < currentDl - 128 * 1024L || offset > currentDl + 2 * 1024 * 1024L
-            if (isSeek) {
-                Log.d(TAG, "[$trackId] Seek jump: read at $offset (downloader at $currentDl). Repositioning stream.")
-                session.startDownloadStream(offset)
-            }
-            // Wait for sufficient bytes to arrive at offset
-            session.waitForBytes(offset, minBytes = minWaitBytes, timeoutMs = 15000L)
+        val bytesRead = session.readBytes(offset, targetLen, data)
+        if (bytesRead < targetLen && (totalSize <= 0 || offset + bytesRead < totalSize)) {
+            Log.e(TAG, "[$trackId] Incomplete read: got $bytesRead of $targetLen at offset $offset")
+            throw ErrnoException("onRead", OsConstants.EIO)
         }
 
-        // 3. Fallback: if stream wait was insufficient or timed out, fetch via direct range
-        var availAfterWait = session.intervals.getAvailableLengthFrom(offset)
-        if (availAfterWait < minWaitBytes && (totalSize <= 0 || offset + availAfterWait < totalSize)) {
-            val needed = if (totalSize > 0) minOf(minWaitBytes, totalSize - offset) else minWaitBytes
-            val fetchStart = offset + availAfterWait
-            val fetchLen = needed - availAfterWait
-            Log.d(TAG, "[$trackId] Stream wait underrun ($availAfterWait < $needed at $offset). Triggering direct range fetch at $fetchStart (len $fetchLen).")
-            session.fetchDirectRange(fetchStart, fetchLen)
-            availAfterWait = session.intervals.getAvailableLengthFrom(offset)
-        }
-
-        // 4. Read available bytes after wait / fallback fetch
-        if (availAfterWait >= minWaitBytes || (totalSize > 0 && offset + availAfterWait >= totalSize)) {
-            val toRead = minOf(maxPossible.toLong(), availAfterWait).toInt()
-            val readBytes = readFully(data, toRead, offset)
-            if (readBytes > 0) {
-                lastReadEnd = offset + readBytes
-            }
-            return readBytes
-        }
-
-        // 5. Underrun: never return 0 when offset < totalSize to avoid premature EOF cutoffs
-        if (totalSize > 0 && offset >= totalSize) {
-            return 0
-        }
-
-        Log.w(TAG, "[$trackId] Read underrun at offset $offset (requested $size bytes, avail=$availAfterWait, total=$totalSize)")
-        throw ErrnoException("onRead", OsConstants.EAGAIN)
+        return bytesRead
     }
 
     override fun onRelease() {
         if (isReleased) return
         isReleased = true
         Log.d(TAG, "[$trackId] Proxy handle released.")
-
-        try {
-            readChannel.close()
-            readRaf.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error closing stream read channel", e)
-        }
-
         releaseSession(trackId)
     }
 
     /**
      * Internal streaming session managing background downloads, interval tracking,
-     * and file channel writes for a specific track. Shared among multiple concurrent
-     * file descriptors opened by Poweramp for the same track.
+     * and synchronized file channel operations for a specific track.
      */
     internal class TrackSession(
         val trackId: String,
@@ -200,13 +138,13 @@ class ProxyStreamHandler(
     ) {
         val intervals = IntervalSet()
         val streamLock = Any()
-        val writeLock = Any()
+        val fileLock = Any()
         val directRangeLock = Any()
         val refCount = AtomicInteger(0)
 
         private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-        private val writeRaf: RandomAccessFile
-        private val writeChannel: FileChannel
+        private val fileRaf: RandomAccessFile
+        private val fileChannel: FileChannel
 
         private var wakeLock: PowerManager.WakeLock? = null
 
@@ -221,9 +159,18 @@ class ProxyStreamHandler(
             val isFullyCached = runBlocking { cacheManager.isTrackFullyCached(trackId) }
             if (!cacheFile.exists()) {
                 cacheFile.createNewFile()
+            } else if (!isFullyCached) {
+                // Clean any partial or stale remnants from previous sessions to guarantee zero sparse gaps
+                try {
+                    cacheFile.delete()
+                    cacheFile.createNewFile()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to reinitialize cache file for $trackId", e)
+                }
             }
-            writeRaf = RandomAccessFile(cacheFile, "rw")
-            writeChannel = writeRaf.channel
+
+            fileRaf = RandomAccessFile(cacheFile, "rw")
+            fileChannel = fileRaf.channel
 
             wakeLock = try {
                 val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -267,22 +214,80 @@ class ProxyStreamHandler(
             }
         }
 
-        fun waitForBytes(offset: Long, minBytes: Long = 1L, timeoutMs: Long = 15000L): Boolean {
+        /**
+         * Reads bytes directly from the synchronized file channel into [data].
+         * Fully thread-safe with writes, enforcing cross-core memory visibility.
+         */
+        fun readBytes(offset: Long, targetLen: Int, data: ByteArray): Int {
+            synchronized(fileLock) {
+                val bb = ByteBuffer.wrap(data, 0, targetLen)
+                var pos = offset
+                while (bb.hasRemaining()) {
+                    val n = fileChannel.read(bb, pos)
+                    if (n <= 0) break
+                    pos += n
+                }
+                return bb.position()
+            }
+        }
+
+        /**
+         * Ensures that the requested byte range [offset, offset + neededBytes) is present in the cache.
+         * Blocks safely on streamLock until bytes arrive or timeout is reached.
+         */
+        fun ensureBytesAvailable(offset: Long, neededBytes: Int, timeoutMs: Long = 30000L): Boolean {
+            if (isReleased) return false
+            val total = totalSizeBytes
+            val targetLen = if (total > 0) minOf(neededBytes.toLong(), total - offset).toInt() else neededBytes
+            if (targetLen <= 0) return true
+
+            // 1. Fast path: check if already downloaded
+            val currentAvail = intervals.getAvailableLengthFrom(offset)
+            if (currentAvail >= targetLen || (total > 0 && offset + currentAvail >= total)) {
+                return true
+            }
+
+            // 2. Check if this is an EOF footer metadata probe (e.g. ID3v1 / FLAC seektable in the last 512KB)
+            val isEndOfFileProbe = total > 512 * 1024L && offset >= (total - 512 * 1024L)
+            if (isEndOfFileProbe) {
+                val footerLen = minOf(total - offset, 256 * 1024L)
+                fetchDirectRange(offset, footerLen)
+                val availAfterFooter = intervals.getAvailableLengthFrom(offset)
+                if (availAfterFooter >= targetLen || (total > 0 && offset + availAfterFooter >= total)) {
+                    return true
+                }
+            } else {
+                // Streaming path: reposition download stream only on true seek
+                val currentDl = currentDownloadOffset
+                val isSeek = (offset < currentDl - 256 * 1024L) || (offset > currentDl + 4 * 1024 * 1024L)
+                if (isSeek) {
+                    Log.d(TAG, "[$trackId] Seek jump detected: read at $offset (downloader at $currentDl). Repositioning stream.")
+                    startDownloadStream(offset)
+                } else if (downloadJob?.isActive != true && (total <= 0 || !intervals.contains(0, total))) {
+                    Log.d(TAG, "[$trackId] Downloader inactive at $currentDl. Restarting from $offset.")
+                    startDownloadStream(offset)
+                }
+            }
+
+            // 3. Blocking wait until bytes are written and flushed
             val deadline = System.currentTimeMillis() + timeoutMs
             synchronized(streamLock) {
                 while (!isReleased && System.currentTimeMillis() < deadline) {
-                    val available = intervals.getAvailableLengthFrom(offset)
-                    val target = if (totalSizeBytes > 0) minOf(totalSizeBytes - offset, minBytes) else minBytes
-                    if (available >= target) return true
-                    if (totalSizeBytes > 0 && offset + available >= totalSizeBytes) return true
-                    if (streamingError) return false
+                    val avail = intervals.getAvailableLengthFrom(offset)
+                    if (avail >= targetLen || (total > 0 && offset + avail >= total)) {
+                        return true
+                    }
+                    if (streamingError) {
+                        return false
+                    }
                     try {
-                        (streamLock as Object).wait(100)
+                        (streamLock as Object).wait(200)
                     } catch (_: InterruptedException) {
                         return false
                     }
                 }
-                return intervals.getAvailableLengthFrom(offset) >= minBytes
+                val finalAvail = intervals.getAvailableLengthFrom(offset)
+                return finalAvail >= targetLen || (total > 0 && offset + finalAvail >= total)
             }
         }
 
@@ -302,7 +307,7 @@ class ProxyStreamHandler(
             downloadJob = scope.launch {
                 var fetchOffset = offset
                 var consecutiveErrors = 0
-                val maxRetries = 5
+                val maxRetries = 10
 
                 while (isActive && !isReleased) {
                     val alreadyAvail = intervals.getAvailableLengthFrom(fetchOffset)
@@ -356,11 +361,11 @@ class ProxyStreamHandler(
                                 return@launch
                             }
 
-                            synchronized(writeLock) {
+                            synchronized(fileLock) {
                                 val bb = ByteBuffer.wrap(buffer, 0, read)
                                 var pos = fetchOffset
                                 while (bb.hasRemaining()) {
-                                    val written = writeChannel.write(bb, pos)
+                                    val written = fileChannel.write(bb, pos)
                                     if (written <= 0) break
                                     pos += written
                                 }
@@ -411,14 +416,15 @@ class ProxyStreamHandler(
 
         fun fetchDirectRange(start: Long, requestedLength: Long) {
             if (isReleased) return
-            val endInclusive = if (totalSizeBytes > 0) {
-                minOf(totalSizeBytes - 1L, start + requestedLength - 1L)
+            val total = totalSizeBytes
+            val endInclusive = if (total > 0) {
+                minOf(total - 1L, start + requestedLength - 1L)
             } else {
                 start + requestedLength - 1L
             }
             if (start > endInclusive) return
 
-            val needed = minOf(requestedLength, if (totalSizeBytes > 0) totalSizeBytes - start else requestedLength)
+            val needed = minOf(requestedLength, if (total > 0) total - start else requestedLength)
             if (intervals.getAvailableLengthFrom(start) >= needed) return
 
             synchronized(directRangeLock) {
@@ -447,11 +453,11 @@ class ProxyStreamHandler(
                             val read = stream.read(buf)
                             if (read <= 0) break
 
-                            synchronized(writeLock) {
+                            synchronized(fileLock) {
                                 val bb = ByteBuffer.wrap(buf, 0, read)
                                 var pos = current
                                 while (bb.hasRemaining()) {
-                                    val written = writeChannel.write(bb, pos)
+                                    val written = fileChannel.write(bb, pos)
                                     if (written <= 0) break
                                     pos += written
                                 }
@@ -487,6 +493,9 @@ class ProxyStreamHandler(
             if (totalSizeBytes > 0 && intervals.contains(0, totalSizeBytes)) {
                 scope.launch {
                     try {
+                        synchronized(fileLock) {
+                            fileChannel.force(true)
+                        }
                         db.trackDao().updateCacheStatus(
                             id = trackId,
                             isFullyCached = true,
@@ -524,11 +533,13 @@ class ProxyStreamHandler(
                 (streamLock as Object).notifyAll()
             }
 
-            try {
-                writeChannel.close()
-                writeRaf.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error closing session write channel", e)
+            synchronized(fileLock) {
+                try {
+                    fileChannel.close()
+                    fileRaf.close()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error closing session file channel", e)
+                }
             }
         }
     }
