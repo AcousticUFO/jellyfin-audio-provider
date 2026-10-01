@@ -33,19 +33,6 @@ class StreamingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            Log.d(TAG, "Stopping streaming foreground service")
-            releaseWakeLock()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
         acquireWakeLock()
         val notification = buildStreamingNotification()
 
@@ -64,7 +51,7 @@ class StreamingService : Service() {
             Log.w(TAG, "Failed to elevate to foreground service", e)
         }
 
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun acquireWakeLock() {
@@ -76,7 +63,7 @@ class StreamingService : Service() {
                 "JellyfinAudioProvider:StreamingForegroundService"
             )?.apply {
                 setReferenceCounted(false)
-                acquire(30 * 60 * 1000L) // 30-minute safety timeout
+                acquire() // Held indefinitely while the foreground service is running
             }
         } catch (e: Exception) {
             Log.w(TAG, "Could not acquire streaming service wake lock", e)
@@ -145,7 +132,6 @@ class StreamingService : Service() {
         private const val CHANNEL_ID = "jellyfin_streaming_channel"
         private const val NOTIFICATION_ID = 1003
         const val ACTION_START = "com.github.jellyfin_saf.action.START_STREAMING"
-        const val ACTION_STOP = "com.github.jellyfin_saf.action.STOP_STREAMING"
 
         fun start(context: Context) {
             try {
@@ -159,17 +145,6 @@ class StreamingService : Service() {
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to start streaming service: ${e.message}")
-            }
-        }
-
-        fun stop(context: Context) {
-            try {
-                val intent = Intent(context, StreamingService::class.java).apply {
-                    action = ACTION_STOP
-                }
-                context.startService(intent)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to stop streaming service: ${e.message}")
             }
         }
     }

@@ -35,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.github.jellyfin_saf.api.JellyfinClient
 import com.github.jellyfin_saf.cache.LRUCacheManager
+import com.github.jellyfin_saf.stream.StreamingService
 import com.github.jellyfin_saf.ui.screens.CacheScreen
 import com.github.jellyfin_saf.ui.screens.ConnectionScreen
 import com.github.jellyfin_saf.ui.screens.HelpScreen
@@ -63,6 +64,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        StreamingService.start(this)
         requestNotificationPermissionIfNeeded()
 
         val client = JellyfinClient(this)

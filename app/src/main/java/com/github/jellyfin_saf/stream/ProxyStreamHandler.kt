@@ -65,8 +65,8 @@ class ProxyStreamHandler(
         if (session.totalSizeBytes <= 0) {
             session.probeTotalSize()
         }
-        // Pre-buffer initial header bytes (512 KB) for instantaneous decoding and Hi-Res headroom
-        val initialPrebuffer = minOf(512 * 1024L, if (session.totalSizeBytes > 0) session.totalSizeBytes else 512 * 1024L)
+        // Pre-buffer initial header bytes (2 MB) for instantaneous decoding and Hi-Res transition headroom
+        val initialPrebuffer = minOf(2 * 1024 * 1024L, if (session.totalSizeBytes > 0) session.totalSizeBytes else 2 * 1024 * 1024L)
         session.ensureBytesAvailable(0L, initialPrebuffer.toInt(), timeoutMs = 10000L)
         cacheManager.onTrackAccessed(trackId)
     }
@@ -305,6 +305,7 @@ class ProxyStreamHandler(
             streamingError = false
 
             downloadJob = scope.launch {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
                 var fetchOffset = offset
                 var consecutiveErrors = 0
                 val maxRetries = 10
@@ -594,16 +595,12 @@ class ProxyStreamHandler(
             val count = session.refCount.decrementAndGet()
             Log.d(TAG, "[$trackId] Session release called (remaining refCount=$count)")
             if (count <= 0) {
-                val appContext = session.context.applicationContext
                 session.scheduleGracefulCleanup(30_000L) {
                     synchronized(Companion) {
                         if (session.refCount.get() <= 0) {
                             activeSessions.remove(trackId)
                             session.close()
                             Log.d(TAG, "[$trackId] Session disposed after grace period.")
-                            if (activeSessions.isEmpty()) {
-                                StreamingService.stop(appContext)
-                            }
                         }
                     }
                 }
