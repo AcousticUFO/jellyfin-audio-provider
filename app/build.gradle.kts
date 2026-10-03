@@ -14,8 +14,8 @@ android {
         applicationId = "com.github.jellyfin_saf"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.3.0"
+        versionCode = 7
+        versionName = "1.4.0"
     }
 
     signingConfigs {
@@ -89,6 +89,9 @@ dependencies {
 
     // Android Keystore-backed EncryptedSharedPreferences
     implementation(libs.androidx.security.crypto)
+
+    // Media Session (process-level audio priority for OomAdjuster / Samsung MARs)
+    implementation(libs.androidx.media)
 
     // Room Database
     implementation(libs.androidx.room.runtime)
