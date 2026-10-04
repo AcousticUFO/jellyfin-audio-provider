@@ -14,7 +14,6 @@ kotlinxCoroutines = "1.9.0"
 junit = "4.13.2"
 androidxJunit = "1.2.1"
 espresso = "3.6.1"
-media = "1.7.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -31,9 +30,6 @@ androidx-compose-material-icons-extended = { group = "androidx.compose.material"
 
 # Security & Encryption
 androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
-
-# Media Session (process-level audio priority signal for OomAdjuster / Samsung MARs)
-androidx-media = { group = "androidx.media", name = "media", version.ref = "media" }
 
 # Local Database (Room)
 androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
