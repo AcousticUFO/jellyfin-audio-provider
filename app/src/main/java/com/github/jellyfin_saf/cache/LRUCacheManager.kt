@@ -47,6 +47,38 @@ class LRUCacheManager(private val context: Context) {
     }
 
     /**
+     * Safely retrieves the cache file for track lyrics (.lrc).
+     */
+    fun getLyricsFile(trackId: String): File {
+        return InputValidator.getSafeFile(tracksDir, "$trackId.lrc")
+    }
+
+    /**
+     * Reads locally cached LRC lyrics if present.
+     */
+    fun getCachedLyrics(trackId: String): String? {
+        return try {
+            val file = getLyricsFile(trackId)
+            if (file.exists() && file.length() > 0) file.readText() else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Saves synchronized LRC lyrics to disk cache.
+     */
+    fun saveLyrics(trackId: String, lrcContent: String) {
+        try {
+            val file = getLyricsFile(trackId)
+            file.writeText(lrcContent)
+            Log.d(TAG, "Cached lyrics for track $trackId (${file.length()} bytes)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to save lyrics cache for track $trackId", e)
+        }
+    }
+
+    /**
      * Safely deletes the cache file for a specific track, if it exists on disk.
      */
     fun evictTrack(trackId: String) {
@@ -55,6 +87,10 @@ class LRUCacheManager(private val context: Context) {
             if (file.exists()) {
                 file.delete()
                 Log.d(TAG, "Evicted cache file for track $trackId")
+            }
+            val lrcFile = getLyricsFile(trackId)
+            if (lrcFile.exists()) {
+                lrcFile.delete()
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to evict cache file for $trackId", e)

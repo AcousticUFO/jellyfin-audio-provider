@@ -386,7 +386,23 @@ class JellyfinClient(context: Context) {
                 if (!response.isSuccessful) return@withContext null
                 val body = response.body?.string() ?: return@withContext null
                 val parsed = json.decodeFromString<LyricsResponse>(body)
-                parsed.lyrics?.joinToString("\n") { it.text }
+                val lines = parsed.lyrics ?: return@withContext null
+                if (lines.isEmpty()) return@withContext null
+
+                val isTimed = lines.any { it.startTicks != null && it.startTicks > 0L }
+                if (isTimed) {
+                    lines.joinToString("\n") { line ->
+                        val ticks = (line.startTicks ?: 0L).coerceAtLeast(0L)
+                        val totalHundredths = ticks / 100_000L
+                        val hundredths = (totalHundredths % 100).toInt()
+                        val totalSeconds = totalHundredths / 100
+                        val seconds = (totalSeconds % 60).toInt()
+                        val minutes = (totalSeconds / 60).toInt()
+                        String.format(java.util.Locale.US, "[%02d:%02d.%02d]%s", minutes, seconds, hundredths, line.text)
+                    }
+                } else {
+                    lines.joinToString("\n") { it.text }
+                }
             }
         } catch (e: Exception) {
             null

@@ -195,6 +195,21 @@ class ProxyStreamHandler(
             } else {
                 startDownloadStream(0L)
             }
+
+            // Pre-fetch lyrics asynchronously into local disk cache
+            scope.launch {
+                try {
+                    if (cacheManager.getCachedLyrics(trackId) == null) {
+                        val lrc = client.getLyrics(trackId)
+                        if (!lrc.isNullOrBlank()) {
+                            cacheManager.saveLyrics(trackId, lrc)
+                            Log.d(TAG, "[$trackId] Pre-cached synchronized lyrics.")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "[$trackId] Could not pre-cache lyrics: ${e.message}")
+                }
+            }
         }
 
         fun scheduleGracefulCleanup(delayMs: Long, onExpire: () -> Unit) {

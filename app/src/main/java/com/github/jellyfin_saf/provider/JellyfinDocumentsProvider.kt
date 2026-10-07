@@ -210,9 +210,12 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     }
 
                     if (metadata != null) {
-                        val lyrics = runBlocking {
-                            kotlinx.coroutines.withTimeoutOrNull(500L) {
-                                client.getLyrics(documentId.trackId)
+                        val cachedLyrics = cacheManager.getCachedLyrics(documentId.trackId)
+                        val lyrics = cachedLyrics ?: runBlocking {
+                            kotlinx.coroutines.withTimeoutOrNull(2000L) {
+                                client.getLyrics(documentId.trackId)?.also { lrc ->
+                                    cacheManager.saveLyrics(documentId.trackId, lrc)
+                                }
                             }
                         }
                         val maxDisc = runBlocking { db.trackDao().getMaxDiscForAlbum(documentId.albumId) } ?: 1
@@ -424,7 +427,11 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
             add(MediaStore.Audio.Media.IS_MUSIC, 1)
 
             if (!lyrics.isNullOrBlank()) {
+                val isSynced = lyrics.contains("[") && lyrics.contains("]")
                 add(COLUMN_TRACK_LYRICS, lyrics)
+                add("lyrics_synced", if (isSynced) 1 else 0)
+                add("track_lyrics", lyrics)
+                add("lrc", lyrics)
             }
         }
     }
@@ -620,6 +627,8 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
             // Lyrics
             "lyrics",
             "lyrics_synced",
+            "track_lyrics",
+            "lrc",
 
             // Poweramp Flags (0x1 = Thumbnail supported)
             "com.maxmpz.poweramp.provider.COLUMN_FLAGS"
