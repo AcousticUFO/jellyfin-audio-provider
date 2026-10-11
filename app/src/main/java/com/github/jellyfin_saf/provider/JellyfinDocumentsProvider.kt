@@ -21,7 +21,10 @@ import com.github.jellyfin_saf.cache.LRUCacheManager
 import com.github.jellyfin_saf.db.AppDatabase
 import com.github.jellyfin_saf.db.TrackEntity
 import com.github.jellyfin_saf.stream.ProxyStreamHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -211,7 +214,32 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     }
 
                     if (metadata != null) {
-                        val lyrics = cacheManager.getCachedLyrics(documentId.trackId)
+                        val needsLyrics = projection == null ||
+                            projection.contains(COLUMN_TRACK_LYRICS) ||
+                            projection.contains(COLUMN_TRACK_LYRICS_SYNCED) ||
+                            projection.contains("track_lyrics") ||
+                            projection.contains("lrc")
+
+                        var lyrics = cacheManager.getCachedLyrics(documentId.trackId)
+                        if (lyrics == null && needsLyrics) {
+                            lyrics = runBlocking {
+                                try {
+                                    kotlinx.coroutines.withTimeoutOrNull(3000L) {
+                                        client.getLyrics(documentId.trackId)
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Failed to fetch lyrics on queryDocument for ${documentId.trackId}", e)
+                                    null
+                                }
+                            }
+                            if (!lyrics.isNullOrBlank()) {
+                                cacheManager.saveLyrics(documentId.trackId, lyrics)
+                                runBlocking {
+                                    try { db.trackDao().updateHasLyrics(documentId.trackId, true) } catch (_: Exception) {}
+                                }
+                            }
+                        }
+
                         val maxDisc = runBlocking { db.trackDao().getMaxDiscForAlbum(documentId.albumId) } ?: 1
                         addTrackRow(result, metadata, maxDisc, lyrics, docIdOverride = docId)
                     }
@@ -275,16 +303,15 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                                     DocumentsContract.Document.COLUMN_FLAGS,
                                     DocumentsContract.Document.FLAG_DIR_PREFERS_GRID or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
                                 )
-                                add(POWERAMP_COLUMN_FLAGS, if (hasSubdirs) 1 else 2)
+                                val folderFlags = if (hasSubdirs) POWERAMP_FLAG_HAS_SUBDIRS else POWERAMP_FLAG_NO_SUBDIRS
+                                add(COLUMN_POWERAMP_FLAGS, folderFlags)
+                                add(POWERAMP_COLUMN_FLAGS_LEGACY, folderFlags)
                             }
                         }
 
                         val rootTracks = runBlocking { db.trackDao().getTracksInDir("") }
                         rootTracks.forEach { track ->
                             addTrackRow(result, track)
-                            if (track.hasLyrics || cacheManager.getLyricsFile(track.id).exists()) {
-                                addLyricRow(result, track)
-                            }
                         }
                     } else {
                         val albums = runBlocking { client.getAlbums() }
@@ -325,7 +352,9 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                                 DocumentsContract.Document.COLUMN_FLAGS,
                                 DocumentsContract.Document.FLAG_DIR_PREFERS_GRID or DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
                             )
-                            add(POWERAMP_COLUMN_FLAGS, if (hasSubdirs) 1 else 2)
+                            val folderFlags = if (hasSubdirs) POWERAMP_FLAG_HAS_SUBDIRS else POWERAMP_FLAG_NO_SUBDIRS
+                            add(COLUMN_POWERAMP_FLAGS, folderFlags)
+                            add(POWERAMP_COLUMN_FLAGS_LEGACY, folderFlags)
                         }
                     }
 
@@ -333,9 +362,6 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     val maxDisc = tracks.maxOfOrNull { (it.discNumber ?: 1).coerceAtLeast(1) } ?: 1
                     tracks.forEach { track ->
                         addTrackRow(result, track, maxDisc)
-                        if (track.hasLyrics || cacheManager.getLyricsFile(track.id).exists()) {
-                            addLyricRow(result, track)
-                        }
                     }
                 }
 
@@ -344,9 +370,6 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     val maxDisc = tracks.maxOfOrNull { (it.discNumber ?: 1).coerceAtLeast(1) } ?: 1
                     tracks.forEach { track ->
                         addTrackRow(result, track, maxDisc)
-                        if (track.hasLyrics || cacheManager.getLyricsFile(track.id).exists()) {
-                            addLyricRow(result, track)
-                        }
                     }
                 }
 
@@ -390,10 +413,12 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
             add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, trackFileName)
             add(DocumentsContract.Document.COLUMN_SIZE, track.sizeBytes)
             add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, track.lastAccessedAt)
-            add(
-                DocumentsContract.Document.COLUMN_FLAGS,
-                DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
-            )
+            var docFlags = DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL or POWERAMP_FLAG_HAS_LYRICS
+            add(DocumentsContract.Document.COLUMN_FLAGS, docFlags)
+
+            var powerampFlags = POWERAMP_FLAG_SUPPORTS_THUMBNAIL or POWERAMP_FLAG_HAS_LYRICS
+            add(COLUMN_POWERAMP_FLAGS, powerampFlags)
+            add(POWERAMP_COLUMN_FLAGS_LEGACY, powerampFlags)
 
             // Pure MediaStore & Poweramp Metadata (unmodified tags)
             add(MediaStore.Audio.Media.TITLE, track.title)
@@ -446,39 +471,22 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
             add("track_number_alt", trk)
             add(MediaStore.Audio.Media.IS_MUSIC, 1)
 
-            if (!lyrics.isNullOrBlank()) {
-                val isSynced = lyrics.contains("[") && lyrics.contains("]")
-                add(COLUMN_TRACK_LYRICS, lyrics)
-                add("lyrics_synced", if (isSynced) 1 else 0)
-                add("track_lyrics", lyrics)
-                add("lrc", lyrics)
+            val effectiveLyrics = lyrics ?: cacheManager.getCachedLyrics(track.id)
+            if (!effectiveLyrics.isNullOrBlank()) {
+                val isSynced = effectiveLyrics.contains("[") && effectiveLyrics.contains("]")
+                if (isSynced) {
+                    add(COLUMN_TRACK_LYRICS_SYNCED, effectiveLyrics)
+                    add(COLUMN_TRACK_LYRICS, effectiveLyrics)
+                } else {
+                    add(COLUMN_TRACK_LYRICS, effectiveLyrics)
+                }
+                add("track_lyrics", effectiveLyrics)
+                add("lrc", effectiveLyrics)
             }
         }
     }
 
-    private fun addLyricRow(
-        result: MatrixCursor,
-        track: TrackEntity
-    ) {
-        val audioFileName = if (track.fileName.isNotBlank()) {
-            track.fileName
-        } else {
-            getTrackDisplayName(track.title, track.mimeType)
-        }
-        val lyricFileName = audioFileName.substringBeforeLast('.') + ".lrc"
-        val docId = DocumentId.forLyric(track.albumId, track.id)
-        val cachedFile = cacheManager.getLyricsFile(track.id)
-        val size = if (cachedFile.exists()) cachedFile.length() else 1024L
 
-        result.newRow().apply {
-            add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, docId)
-            add(DocumentsContract.Document.COLUMN_MIME_TYPE, "text/plain")
-            add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, lyricFileName)
-            add(DocumentsContract.Document.COLUMN_SIZE, size)
-            add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, track.lastAccessedAt)
-            add(DocumentsContract.Document.COLUMN_FLAGS, 0)
-        }
-    }
 
     override fun openDocument(
         documentId: String,
@@ -512,6 +520,19 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
 
         if (parsedId !is DocumentId.Track) {
             throw IOException("Unsupported document type for openDocument: $documentId")
+        }
+
+        // Asynchronously prefetch lyrics if not already cached
+        if (!cacheManager.getLyricsFile(parsedId.trackId).exists()) {
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val lrc = client.getLyrics(parsedId.trackId)
+                    if (!lrc.isNullOrBlank()) {
+                        cacheManager.saveLyrics(parsedId.trackId, lrc)
+                        db.trackDao().updateHasLyrics(parsedId.trackId, true)
+                    }
+                } catch (_: Exception) {}
+            }
         }
 
         val ctx = context ?: throw IOException("Context unavailable")
@@ -698,12 +719,20 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
             "track_lyrics",
             "lrc",
 
-            // Poweramp Flags (0x1 = Thumbnail supported)
+            // Poweramp Flags
+            "__flags",
             "com.maxmpz.poweramp.provider.COLUMN_FLAGS"
         )
 
         private const val COLUMN_TRACK_LYRICS = "lyrics"
-        private const val POWERAMP_COLUMN_FLAGS = "com.maxmpz.poweramp.provider.COLUMN_FLAGS"
+        private const val COLUMN_TRACK_LYRICS_SYNCED = "lyrics_synced"
+        private const val COLUMN_POWERAMP_FLAGS = "__flags"
+        private const val POWERAMP_COLUMN_FLAGS_LEGACY = "com.maxmpz.poweramp.provider.COLUMN_FLAGS"
+
+        private const val POWERAMP_FLAG_SUPPORTS_THUMBNAIL = 0x0001
+        private const val POWERAMP_FLAG_NO_SUBDIRS = 0x0001
+        private const val POWERAMP_FLAG_HAS_SUBDIRS = 0x0002
+        private const val POWERAMP_FLAG_HAS_LYRICS = 0x0004
 
         fun getTrackDisplayName(
             title: String,

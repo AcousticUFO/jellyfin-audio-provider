@@ -59,7 +59,10 @@ class LRUCacheManager(private val context: Context) {
     fun getCachedLyrics(trackId: String): String? {
         return try {
             val file = getLyricsFile(trackId)
-            if (file.exists() && file.length() > 0) file.readText() else null
+            if (file.exists() && file.length() > 0) {
+                val text = file.readText()
+                if (text.isNotBlank()) text else null
+            } else null
         } catch (_: Exception) {
             null
         }

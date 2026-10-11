@@ -379,11 +379,15 @@ class JellyfinClient(context: Context) {
                 .url(url)
                 .header("Accept", "application/json")
                 .header("X-Emby-Authorization", getAuthHeader(token))
+                .header("X-Emby-Token", token)
                 .get()
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return@withContext null
+                if (!response.isSuccessful) {
+                    Log.w(TAG, "getLyrics for $trackId failed: HTTP ${response.code} ${response.message}")
+                    return@withContext null
+                }
                 val body = response.body?.string() ?: return@withContext null
                 val parsed = json.decodeFromString<LyricsResponse>(body)
                 val lines = parsed.lyrics ?: return@withContext null
@@ -398,13 +402,14 @@ class JellyfinClient(context: Context) {
                         val totalSeconds = totalHundredths / 100
                         val seconds = (totalSeconds % 60).toInt()
                         val minutes = (totalSeconds / 60).toInt()
-                        String.format(java.util.Locale.US, "[%02d:%02d.%02d]%s", minutes, seconds, hundredths, line.text)
+                        String.format(java.util.Locale.US, "[%02d:%02d.%02d]%s", minutes, seconds, hundredths, line.text ?: "")
                     }
                 } else {
-                    lines.joinToString("\n") { it.text }
+                    lines.joinToString("\n") { it.text ?: "" }
                 }
             }
         } catch (e: Exception) {
+            Log.e(TAG, "Error fetching lyrics for $trackId", e)
             null
         }
     }
