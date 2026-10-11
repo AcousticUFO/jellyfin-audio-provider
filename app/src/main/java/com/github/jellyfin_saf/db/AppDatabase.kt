@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [TrackEntity::class], version = 5, exportSchema = false)
+@Database(entities = [TrackEntity::class], version = 6, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
 
     abstract fun trackDao(): TrackDao
@@ -15,7 +15,7 @@ abstract class AppDatabase : RoomDatabase() {
     companion object {
         private const val DB_NAME = "jellyfin_audio_cache.db"
 
-        private fun recreateTableV5(db: SupportSQLiteDatabase) {
+        private fun recreateTableV6(db: SupportSQLiteDatabase) {
             db.execSQL("DROP INDEX IF EXISTS index_tracks_grouping")
             db.execSQL("""
                 CREATE TABLE IF NOT EXISTS tracks_new (
@@ -39,7 +39,8 @@ abstract class AppDatabase : RoomDatabase() {
                     cachedBytes INTEGER NOT NULL,
                     path TEXT,
                     relativeDir TEXT NOT NULL DEFAULT '',
-                    fileName TEXT NOT NULL DEFAULT ''
+                    fileName TEXT NOT NULL DEFAULT '',
+                    hasLyrics INTEGER NOT NULL DEFAULT 0
                 )
             """.trimIndent())
 
@@ -53,17 +54,21 @@ abstract class AppDatabase : RoomDatabase() {
 
             val hasPath = columns.contains("path")
             val pathCol = if (hasPath) "path" else "NULL as path"
+            val hasLrc = columns.contains("hasLyrics")
+            val lrcCol = if (hasLrc) "hasLyrics" else "0 as hasLyrics"
 
             db.execSQL("""
                 INSERT INTO tracks_new (
                     id, albumId, title, artist, album, albumArtist, composer, genre,
                     durationMs, sizeBytes, mimeType, year, trackNumber, discNumber,
-                    isFavorite, lastAccessedAt, isFullyCached, cachedBytes, path
+                    isFavorite, lastAccessedAt, isFullyCached, cachedBytes, path,
+                    relativeDir, fileName, hasLyrics
                 )
                 SELECT
                     id, albumId, title, artist, album, albumArtist, composer, genre,
                     durationMs, sizeBytes, mimeType, year, trackNumber, discNumber,
-                    isFavorite, lastAccessedAt, isFullyCached, cachedBytes, $pathCol
+                    isFavorite, lastAccessedAt, isFullyCached, cachedBytes, $pathCol,
+                    relativeDir, fileName, $lrcCol
                 FROM tracks
             """.trimIndent())
             db.execSQL("DROP TABLE tracks")
@@ -75,27 +80,33 @@ abstract class AppDatabase : RoomDatabase() {
             db.execSQL("CREATE INDEX IF NOT EXISTS index_tracks_isFullyCached ON tracks(isFullyCached)")
         }
 
-        val MIGRATION_4_5 = object : Migration(4, 5) {
+        val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                recreateTableV5(db)
+                db.execSQL("ALTER TABLE tracks ADD COLUMN hasLyrics INTEGER NOT NULL DEFAULT 0")
             }
         }
 
-        val MIGRATION_3_5 = object : Migration(3, 5) {
+        val MIGRATION_4_6 = object : Migration(4, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                recreateTableV5(db)
+                recreateTableV6(db)
             }
         }
 
-        val MIGRATION_2_5 = object : Migration(2, 5) {
+        val MIGRATION_3_6 = object : Migration(3, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                recreateTableV5(db)
+                recreateTableV6(db)
             }
         }
 
-        val MIGRATION_1_5 = object : Migration(1, 5) {
+        val MIGRATION_2_6 = object : Migration(2, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                recreateTableV5(db)
+                recreateTableV6(db)
+            }
+        }
+
+        val MIGRATION_1_6 = object : Migration(1, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                recreateTableV6(db)
             }
         }
 
@@ -109,7 +120,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     DB_NAME
                 )
-                .addMigrations(MIGRATION_4_5, MIGRATION_3_5, MIGRATION_2_5, MIGRATION_1_5)
+                .addMigrations(MIGRATION_5_6, MIGRATION_4_6, MIGRATION_3_6, MIGRATION_2_6, MIGRATION_1_6)
                 .fallbackToDestructiveMigration()
                 .build()
                 .also { INSTANCE = it }

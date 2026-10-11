@@ -35,5 +35,6 @@ data class TrackEntity(
     val cachedBytes: Long = 0L,
     val path: String? = null,
     val relativeDir: String = "",
-    val fileName: String = ""
+    val fileName: String = "",
+    val hasLyrics: Boolean = false
 )

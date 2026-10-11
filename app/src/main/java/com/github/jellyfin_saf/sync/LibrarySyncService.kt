@@ -104,7 +104,8 @@ class LibrarySyncService : Service() {
                         isFavorite = track.userData?.isFavorite ?: false,
                         path = track.path ?: track.mediaSources?.firstOrNull()?.path,
                         relativeDir = relDir,
-                        fileName = fileName
+                        fileName = fileName,
+                        hasLyrics = track.hasLyrics ?: false
                     )
                 }
 

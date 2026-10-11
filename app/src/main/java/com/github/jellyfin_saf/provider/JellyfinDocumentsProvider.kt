@@ -201,7 +201,8 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                                     isFavorite = it.userData?.isFavorite ?: false,
                                     path = it.path ?: it.mediaSources?.firstOrNull()?.path,
                                     relativeDir = relDir,
-                                    fileName = fileName
+                                    fileName = fileName,
+                                    hasLyrics = it.hasLyrics ?: false
                                 )
                                 db.trackDao().insertOrUpdate(entity)
                                 entity
@@ -210,19 +211,29 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     }
 
                     if (metadata != null) {
-                        val cachedLyrics = cacheManager.getCachedLyrics(documentId.trackId)
-                        val lyrics = cachedLyrics ?: runBlocking {
-                            kotlinx.coroutines.withTimeoutOrNull(2000L) {
-                                client.getLyrics(documentId.trackId)?.also { lrc ->
-                                    cacheManager.saveLyrics(documentId.trackId, lrc)
-                                }
-                            }
-                        }
+                        val lyrics = cacheManager.getCachedLyrics(documentId.trackId)
                         val maxDisc = runBlocking { db.trackDao().getMaxDiscForAlbum(documentId.albumId) } ?: 1
                         addTrackRow(result, metadata, maxDisc, lyrics, docIdOverride = docId)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error querying track document $docId", e)
+                }
+            }
+
+            is DocumentId.Lyric -> {
+                val track = runBlocking { db.trackDao().getTrack(documentId.trackId) }
+                val audioFileName = track?.fileName?.takeIf { it.isNotBlank() } ?: ((track?.title ?: "lyrics") + ".flac")
+                val lyricFileName = audioFileName.substringBeforeLast('.') + ".lrc"
+                val cachedFile = cacheManager.getLyricsFile(documentId.trackId)
+                val size = if (cachedFile.exists()) cachedFile.length() else 1024L
+
+                result.newRow().apply {
+                    add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, docId)
+                    add(DocumentsContract.Document.COLUMN_MIME_TYPE, "text/plain")
+                    add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, lyricFileName)
+                    add(DocumentsContract.Document.COLUMN_SIZE, size)
+                    add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, track?.lastAccessedAt ?: System.currentTimeMillis())
+                    add(DocumentsContract.Document.COLUMN_FLAGS, 0)
                 }
             }
         }
@@ -271,6 +282,9 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                         val rootTracks = runBlocking { db.trackDao().getTracksInDir("") }
                         rootTracks.forEach { track ->
                             addTrackRow(result, track)
+                            if (track.hasLyrics || cacheManager.getLyricsFile(track.id).exists()) {
+                                addLyricRow(result, track)
+                            }
                         }
                     } else {
                         val albums = runBlocking { client.getAlbums() }
@@ -319,6 +333,9 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     val maxDisc = tracks.maxOfOrNull { (it.discNumber ?: 1).coerceAtLeast(1) } ?: 1
                     tracks.forEach { track ->
                         addTrackRow(result, track, maxDisc)
+                        if (track.hasLyrics || cacheManager.getLyricsFile(track.id).exists()) {
+                            addLyricRow(result, track)
+                        }
                     }
                 }
 
@@ -327,6 +344,9 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
                     val maxDisc = tracks.maxOfOrNull { (it.discNumber ?: 1).coerceAtLeast(1) } ?: 1
                     tracks.forEach { track ->
                         addTrackRow(result, track, maxDisc)
+                        if (track.hasLyrics || cacheManager.getLyricsFile(track.id).exists()) {
+                            addLyricRow(result, track)
+                        }
                     }
                 }
 
@@ -436,14 +456,62 @@ class JellyfinDocumentsProvider : DocumentsProvider() {
         }
     }
 
+    private fun addLyricRow(
+        result: MatrixCursor,
+        track: TrackEntity
+    ) {
+        val audioFileName = if (track.fileName.isNotBlank()) {
+            track.fileName
+        } else {
+            getTrackDisplayName(track.title, track.mimeType)
+        }
+        val lyricFileName = audioFileName.substringBeforeLast('.') + ".lrc"
+        val docId = DocumentId.forLyric(track.albumId, track.id)
+        val cachedFile = cacheManager.getLyricsFile(track.id)
+        val size = if (cachedFile.exists()) cachedFile.length() else 1024L
+
+        result.newRow().apply {
+            add(DocumentsContract.Document.COLUMN_DOCUMENT_ID, docId)
+            add(DocumentsContract.Document.COLUMN_MIME_TYPE, "text/plain")
+            add(DocumentsContract.Document.COLUMN_DISPLAY_NAME, lyricFileName)
+            add(DocumentsContract.Document.COLUMN_SIZE, size)
+            add(DocumentsContract.Document.COLUMN_LAST_MODIFIED, track.lastAccessedAt)
+            add(DocumentsContract.Document.COLUMN_FLAGS, 0)
+        }
+    }
+
     override fun openDocument(
         documentId: String,
         mode: String,
         signal: CancellationSignal?
     ): ParcelFileDescriptor {
         val parsedId = DocumentId.parse(documentId)
+
+        if (parsedId is DocumentId.Lyric) {
+            val lrcFile = cacheManager.getLyricsFile(parsedId.trackId)
+            if (!lrcFile.exists() || lrcFile.length() == 0L) {
+                val lrcContent = runBlocking {
+                    try {
+                        client.getLyrics(parsedId.trackId)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to fetch lyrics for ${parsedId.trackId}", e)
+                        null
+                    }
+                }
+                if (!lrcContent.isNullOrBlank()) {
+                    cacheManager.saveLyrics(parsedId.trackId, lrcContent)
+                    runBlocking {
+                        try { db.trackDao().updateHasLyrics(parsedId.trackId, true) } catch (_: Exception) {}
+                    }
+                } else {
+                    lrcFile.writeText("")
+                }
+            }
+            return ParcelFileDescriptor.open(lrcFile, ParcelFileDescriptor.MODE_READ_ONLY)
+        }
+
         if (parsedId !is DocumentId.Track) {
-            throw IOException("Only track documents can be opened for audio playback. Requested: $documentId")
+            throw IOException("Unsupported document type for openDocument: $documentId")
         }
 
         val ctx = context ?: throw IOException("Context unavailable")

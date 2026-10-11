@@ -505,7 +505,7 @@ class JellyfinClient(context: Context) {
         const val CLIENT_NAME = "Jellyfin Audio Provider"
         const val CLIENT_VERSION = "1.0.0"
 
-        const val AUDIO_ITEM_FIELDS = "ParentIndexNumber,IndexNumber,ProductionYear,PremiereDate,MediaSources,Genres,AlbumArtist,Artists,AlbumArtists,ArtistItems,People,Path"
+        const val AUDIO_ITEM_FIELDS = "ParentIndexNumber,IndexNumber,ProductionYear,PremiereDate,MediaSources,Genres,AlbumArtist,Artists,AlbumArtists,ArtistItems,People,Path,HasLyrics"
         const val ALBUM_ITEM_FIELDS = "ChildCount,Genres,MediaSources,AlbumArtist,Artists,AlbumArtists,ArtistItems,ProductionYear,People"
     }
 }

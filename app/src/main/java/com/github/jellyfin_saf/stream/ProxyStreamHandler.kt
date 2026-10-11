@@ -203,6 +203,7 @@ class ProxyStreamHandler(
                         val lrc = client.getLyrics(trackId)
                         if (!lrc.isNullOrBlank()) {
                             cacheManager.saveLyrics(trackId, lrc)
+                            try { db.trackDao().updateHasLyrics(trackId, true) } catch (_: Exception) {}
                             Log.d(TAG, "[$trackId] Pre-cached synchronized lyrics.")
                         }
                     }

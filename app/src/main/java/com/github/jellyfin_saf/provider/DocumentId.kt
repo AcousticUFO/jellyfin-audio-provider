@@ -19,12 +19,17 @@ sealed class DocumentId {
         val sizeBytes: Long,
         val durationMs: Long
     ) : DocumentId()
+    data class Lyric(
+        val albumId: String,
+        val trackId: String
+    ) : DocumentId()
 
     companion object {
         const val ROOT_ID = "root"
         private const val PREFIX_FOLDER = "dir:"
         private const val PREFIX_ALBUM = "album:"
         private const val PREFIX_TRACK = "track:"
+        private const val PREFIX_LYRIC = "lyric:"
 
         fun forFolder(relativeDir: String): String {
             val b64 = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(relativeDir.toByteArray(Charsets.UTF_8))
@@ -42,6 +47,12 @@ sealed class DocumentId {
             return "$PREFIX_TRACK$albumId:$trackId:$sizeBytes:$durationMs"
         }
 
+        fun forLyric(albumId: String, trackId: String): String {
+            require(InputValidator.isValidUuid(albumId)) { "Invalid album UUID" }
+            require(InputValidator.isValidUuid(trackId)) { "Invalid track UUID" }
+            return "$PREFIX_LYRIC$albumId:$trackId"
+        }
+
         fun parse(rawDocId: String): DocumentId {
             var docId = if (rawDocId.contains("%")) {
                 try {
@@ -57,7 +68,12 @@ sealed class DocumentId {
                 docId = docId.removePrefix("root/")
             }
 
-            if (docId.contains(PREFIX_TRACK)) {
+            if (docId.contains(PREFIX_LYRIC)) {
+                val lastIdx = docId.lastIndexOf(PREFIX_LYRIC)
+                if (lastIdx >= 0) {
+                    docId = docId.substring(lastIdx)
+                }
+            } else if (docId.contains(PREFIX_TRACK)) {
                 val lastIdx = docId.lastIndexOf(PREFIX_TRACK)
                 if (lastIdx >= 0) {
                     docId = docId.substring(lastIdx)
@@ -117,6 +133,18 @@ sealed class DocumentId {
                         throw IllegalArgumentException("Invalid UUIDs in track document ID: $docId")
                     }
                     Track(albumId, trackId, size, duration)
+                }
+                docId.startsWith(PREFIX_LYRIC) -> {
+                    val parts = docId.removePrefix(PREFIX_LYRIC).split(":")
+                    if (parts.size != 2) {
+                        throw IllegalArgumentException("Malformed lyric document ID: $docId")
+                    }
+                    val albumId = parts[0]
+                    val trackId = parts[1]
+                    if (!InputValidator.isValidUuid(albumId) || !InputValidator.isValidUuid(trackId)) {
+                        throw IllegalArgumentException("Invalid UUIDs in lyric document ID: $docId")
+                    }
+                    Lyric(albumId, trackId)
                 }
                 else -> throw IllegalArgumentException("Unknown document ID format: $docId")
             }

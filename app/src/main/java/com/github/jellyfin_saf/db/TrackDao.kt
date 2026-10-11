@@ -60,6 +60,9 @@ interface TrackDao {
     @Query("UPDATE tracks SET isFullyCached = :isFullyCached, cachedBytes = :cachedBytes, lastAccessedAt = :timestamp WHERE id = :id")
     suspend fun updateCacheStatus(id: String, isFullyCached: Boolean, cachedBytes: Long, timestamp: Long = System.currentTimeMillis())
 
+    @Query("UPDATE tracks SET hasLyrics = :hasLyrics WHERE id = :id")
+    suspend fun updateHasLyrics(id: String, hasLyrics: Boolean)
+
     @Query("SELECT * FROM tracks WHERE cachedBytes > 0 AND isFavorite = 0 ORDER BY lastAccessedAt ASC")
     suspend fun getOldestCachedTracksExcludingFavorites(): List<TrackEntity>
 
