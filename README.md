@@ -20,8 +20,19 @@ A high-performance Android [Storage Access Framework](https://developer.android.
 - Continuous background filling downloads remaining bytes without interrupting playback.
 - Once a track is fully downloaded, subsequent playbacks are served directly from disk with zero network overhead.
 
-### Background Foreground Service Sync
+### Background Playback Continuity & OS Anti-Freezer
+- Dedicated foreground playback service (`StreamingService`) running with `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK` and `START_STICKY`.
+- Indefinite CPU partial wake lock prevents Samsung One UI App Freezer (MARs) and Android 14+ cgroup freezes during app switches, screen lock, and system multitasking.
+- Stream proxy threads run with elevated `Process.THREAD_PRIORITY_AUDIO` (`-16`) scheduling priority, guaranteeing micro-cut-free Binder reads.
+
+### Synchronized Lyrics (LRC) & Real-Time Scrolling
+- **Full LRC Conversion:** Converts 100ns Jellyfin server ticks into standard LRC timestamp tags (`[mm:ss.xx]Text`) in real-time.
+- **Native Poweramp Integration:** Delivers synchronized lyrics via `lyrics_synced` and `lyrics` cursor columns, and declares the Poweramp API `FLAG_HAS_LYRICS` (`0x0004`) flag in `__flags` to activate Poweramp's scrolling lyrics UI.
+- **Local Disk Caching & Background Pre-caching:** Fetched lyrics are persisted as `.lrc` files in internal storage for instant 0 ms offline access. As soon as a track begins streaming, lyrics are pre-fetched asynchronously in the background.
+
+### Background Foreground Service Sync & Reconciliation
 - Synchronizes your entire library metadata via a dedicated Android foreground service (`dataSync`).
+- **Mark-and-Sweep Reconciliation:** Automatically purges obsolete, moved, or retagged tracks from the local SQLite Room index and deletes orphaned disk cache files.
 - Persists across app switches, screen lock, and memory pressure with a real-time progress notification.
 - CPU partial wake lock prevents Android from suspending sync operations on large music collections (tested on 14,000+ tracks).
 
@@ -31,7 +42,7 @@ A high-performance Android [Storage Access Framework](https://developer.android.
   - MediaStore compound track numbering (`disc * 1000 + track`) for accurate multi-disc sorting.
   - Multi-variant disc columns (`disc_number`, `disc_total`, `tpos`, `part_of_a_set`).
   - Unmodified audio tags (`ALBUM`, `ARTIST`, `COMPOSER`, `GENRE`, `YEAR`).
-  - Synchronized and unsynchronized lyrics pass-through.
+  - Native synchronized (`lyrics_synced`) and unsynchronized (`lyrics`) metadata delivery.
 
 ### Configurable LRU Cache Manager
 - Set storage quotas (e.g. 2 GB, 5 GB, 10 GB) with automatic Least-Recently-Used eviction.
@@ -66,9 +77,10 @@ com.github.jellyfin_saf/
 ├── security/         # EncryptedSharedPreferences and path traversal validators
 │   ├── InputValidator.kt
 │   └── SecurePreferences.kt
-├── stream/           # HTTP Range streaming engine and non-blocking proxy
+├── stream/           # HTTP Range streaming engine, proxy, and playback service
 │   ├── IntervalSet.kt
-│   └── ProxyStreamHandler.kt
+│   ├── ProxyStreamHandler.kt
+│   └── StreamingService.kt
 ├── sync/             # Foreground synchronization service and state manager
 │   ├── LibrarySyncManager.kt
 │   └── LibrarySyncService.kt
@@ -144,7 +156,16 @@ Prebuilt release APKs are available on the [Releases](https://github.com/Acousti
 5. Grant access when prompted by the system.
 6. Poweramp will scan the collection and populate your artists, albums, tracks, and artwork.
 
-For detailed recommendations on Poweramp scanner settings, see [docs/POWERAMP_CONFIGURATION.md](docs/POWERAMP_CONFIGURATION.md).
+### 3. Recommended Poweramp Buffer Settings (Zero Micro-cuts)
+For completely stutter-free and micro-cut-free playback over Android SAF during heavy UI animations (e.g. returning to the home launcher or opening the Recents app switcher):
+1. In Poweramp, open **Settings** > **Audio** > **Output**.
+2. Select your active output method (e.g. *OpenSL ES Output* or *AudioTrack Output*) and tap its settings gear icon.
+3. Configure the following parameters:
+   - **Buffer size:** `100 ms`
+   - **Number of buffers:** `5` (yielding ~500–600 ms total buffer headroom)
+   - **Audio Thread Priority:** `+2`
+
+For detailed recommendations on Poweramp scanner settings and album artwork, see [docs/POWERAMP_CONFIGURATION.md](docs/POWERAMP_CONFIGURATION.md).
 
 ---
 

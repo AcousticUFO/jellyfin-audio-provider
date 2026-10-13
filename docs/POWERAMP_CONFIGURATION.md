@@ -32,10 +32,19 @@ To browse different editions distinctly:
 
 Because audio tracks are streamed on-demand over HTTP, configuring optimal buffer sizes in Poweramp ensures smooth, stutter-free playback even on fluctuating mobile connections:
 
-### Audio Buffer
-1. Go to **Settings** > **Audio** > **Audio Buffer**.
-2. Set the buffer size to **Huge (+750ms)** or **Maximum (+1000ms)**.
-3. This provides extra headroom during track changes and high-bitrate FLAC streaming.
+### Audio Output Buffer & Thread Priority (Zero Micro-cuts)
+When streaming over Android SAF, system UI transitions (switching apps, returning to the home launcher, or opening the Recents overview) can briefly delay Binder I/O calls. To completely eliminate micro-cuts:
+1. Open **Settings** > **Audio** > **Output**.
+2. Select your active output plugin (e.g. *OpenSL ES Output*, *AudioTrack Output*, or *Hi-Res Output*) and tap its gear icon.
+3. Configure the following parameters:
+   - **Buffer size:** `100 ms`
+   - **Number of buffers:** `4` or `5` (yielding a total buffer of ~500–600 ms)
+   - **Audio Thread Priority:** `+2`
+
+### Synchronized Lyrics (LRC)
+1. For any track with lyrics on your Jellyfin server, Poweramp automatically displays the lyrics button (indicated by the `FLAG_HAS_LYRICS` provider flag).
+2. Tapping the lyrics button loads real-time synchronized scrolling lyrics formatted with `[mm:ss.xx]` timestamps.
+3. Lyrics are cached locally on device storage upon first access and pre-fetched in the background when playback begins.
 
 ### Artwork Cache
 1. Go to **Settings** > **Album Art**.

@@ -26,7 +26,7 @@
          |                                           |
          v                                           v
 +-----------------------+               +-----------------------+
-|   SQLite / Room v5    |               |  ProxyStreamHandler   |
+|   SQLite / Room v6    |               |  ProxyStreamHandler   |
 |   (Local Metadata)    |               |  - Header Parser      |
 |  - TrackEntity        |               |  - IntervalSet Cache  |
 |  - RelativeDir Index  |               |  - OkHttp Range Feeds |
@@ -107,4 +107,26 @@ High-resolution FLAC files (24-bit / 96 kHz or 192 kHz) often contain embedded c
 - Implemented as an Android Foreground Service with the `dataSync` service type.
 - Acquires a `PARTIAL_WAKE_LOCK` for the duration of the synchronization.
 - Fetches track and album metadata from Jellyfin in paginated batches of 1,000 items.
-- Updates an ongoing notification with current progress and informs the user upon completion.
+- **Mark-and-Sweep Reconciliation:** At the end of the sync pass, tracks removed or retagged on Jellyfin are reconciled and purged from Room and disk cache.
+- Updates an ongoing notification with current progress and notifies the content resolver upon completion.
+
+---
+
+## 5. Playback Continuity Service (`StreamingService`)
+
+- Implemented as a persistent Foreground Service with `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK` and `START_STICKY`.
+- Started from `MainActivity.onCreate()` (foreground UI context) to comply with Android 14+ background launch constraints.
+- Maintains an indefinite `PARTIAL_WAKE_LOCK` across track changes and screen-off states.
+- Shields the application process against Samsung One UI App Freezer (MARs) and Android cgroup freezer suspension.
+- Configures proxy streaming worker threads with `Process.THREAD_PRIORITY_AUDIO` (`-16`) priority.
+
+---
+
+## 6. Synchronized Lyrics Engine
+
+- **Real-Time LRC Formatter (`JellyfinClient`):** Reads Jellyfin 100ns `Start` ticks from `/Audio/{id}/Lyrics` and converts them into standard LRC timestamps (`[mm:ss.xx]Text`).
+- **Poweramp SAF Protocol (`JellyfinDocumentsProvider`):** 
+  - Asserts `TrackProviderConsts.FLAG_HAS_LYRICS` (`0x0004`) in `__flags` and `Document.COLUMN_FLAGS`.
+  - Serves LRC lyrics through `lyrics_synced` and `lyrics` cursor columns.
+  - Resolves lyrics on-demand during metadata queries with a 3-second network timeout.
+- **Persistent Disk Caching (`LRUCacheManager`):** Caches `.lrc` files in `context.cacheDir/audio_cache/<trackId>.lrc` for instantaneous (0 ms) offline availability. Pre-fetches lyrics asynchronously when audio playback begins.
